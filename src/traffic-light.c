@@ -664,15 +664,24 @@ static void paintNow(void)
     ReleaseDC(NULL, screen);
 }
 
+/* Vuelve a reclamar el tope del z-order.
+   Hace falta llamarlo seguido: la luz aparece justo cuando OTRA aplicacion se
+   esta activando, y esa activacion puede dejarnos debajo. Reclamarlo una sola
+   vez al mostrar pierde esa carrera. */
+static void assertTopmost(void)
+{
+    SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+}
+
 static void showLight(void)
 {
     if (g_phase == PH_HIDDEN) {
         g_alpha = 0;
         paintNow();
         ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
-        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
+    assertTopmost();
     if (g_phase == PH_HIDDEN || g_phase == PH_OUT)
         g_phase = PH_IN;                 /* arrancar (o revertir) el fundido */
     else if (g_phase != PH_IN)
@@ -695,6 +704,9 @@ static void onTimer(void)
 {
     DWORD now  = GetTickCount();
     DWORD span = now - g_holdStart;
+
+    /* barato: solo corre mientras la luz esta en pantalla */
+    if (g_phase != PH_HIDDEN) assertTopmost();
 
     switch (g_phase) {
     case PH_IN: {
@@ -766,6 +778,8 @@ static void CALLBACK winEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
     BOOL now = isClaudeWindow(hwnd);
     if (g_claudeFocus && !now && g_showOnBlur)
         showLight();                 /* te fuiste de Claude -> avisar */
+    else if (g_phase != PH_HIDDEN)
+        assertTopmost();             /* cambio de ventana: seguimos arriba */
     g_claudeFocus = now;
 }
 
