@@ -1,0 +1,24 @@
+{
+  "_comment": "Paste the contents of \"hooks\" into %USERPROFILE%\\.claude\\settings.json. Replace C:\\\\Tools\\\\ClaudeTrafficLight\\\\claude-traffic-light.exe with the real path. Or just run install-hooks.cmd and let it do this for you.",
+
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "\"C:\\Tools\\ClaudeTrafficLight\\claude-traffic-light.exe\" --state done" } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "\"C:\\Tools\\ClaudeTrafficLight\\claude-traffic-light.exe\" --state running" } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "\"C:\\Tools\\ClaudeTrafficLight\\claude-traffic-light.exe\" --state running" } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "\"C:\\Tools\\ClaudeTrafficLight\\claude-traffic-light.exe\" --state running" } ] }
+    ],
+    "Notification": [
+      { "hooks": [ { "type": "command", "command": "\"C:\\Tools\\ClaudeTrafficLight\\claude-traffic-light.exe\" --state waiting" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "\"C:\\Tools\\ClaudeTrafficLight\\claude-traffic-light.exe\" --state done" } ] }
+    ]
+  }
+}
