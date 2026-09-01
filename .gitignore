@@ -1,0 +1,17 @@
+# build output
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+build/
+
+# local config the user may tweak
+traffic-light.local.ini
+
+# editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
