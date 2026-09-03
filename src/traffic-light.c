@@ -13,8 +13,12 @@
  * MIT licensed. See LICENSE.
  */
 
+#ifndef UNICODE
 #define UNICODE
+#endif
+#ifndef _UNICODE
 #define _UNICODE
+#endif
 #define WINVER 0x0601
 #define _WIN32_WINNT 0x0601
 
@@ -37,6 +41,7 @@
 #define TIMER_ANIM     1
 #define TIMER_RAISE    2
 #define TIMER_WATCH    3
+#define WM_PORTFAIL    (WM_APP + 3)
 
 #define ST_WAITING 0   /* rojo    */
 #define ST_RUNNING 1   /* amarillo*/
@@ -78,6 +83,8 @@ static DWORD g_holdStart  = 0;
 static BOOL g_claudeFocus = FALSE;
 static BOOL g_autostart   = FALSE;
 static DWORD g_watchUntil = 0;   /* 0 = sin vigilancia */
+static BOOL  g_portOk     = TRUE; /* FALSE si no se pudo abrir el puerto */
+static UINT  g_msgTaskbarCreated = 0;
 
 /* configuracion */
 static int   g_port          = 8787;
@@ -183,6 +190,10 @@ static void loadConfig(void)
     lowerW(g_position);
     lowerW(g_match);
 
+    if (g_margin < 0)      g_margin = 0;
+    if (g_margin > 400)    g_margin = 400;
+    if (g_fadeInMs  > 5000)  g_fadeInMs  = 5000;
+    if (g_fadeOutMs > 5000)  g_fadeOutMs = 5000;
     if (g_verticalPct < 0)   g_verticalPct = 0;
     if (g_verticalPct > 100) g_verticalPct = 100;
     if (g_scalePct < 40)   g_scalePct = 40;
@@ -500,7 +511,9 @@ static void buildBitmaps(void)
 
 static HICON makeTrayIcon(int state)
 {
-    const int N = 16;
+    enum { N = 16 };   /* enum, no "const int": const int no es una constante
+                          en C y convertia maskbits[] en un VLA, que MSVC
+                          rechaza. Rompia el build documentado en build.cmd. */
     BITMAPINFO bi;
     ZeroMemory(&bi, sizeof(bi));
     bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
@@ -557,10 +570,15 @@ static void trayUpdate(BOOL add)
     g_trayicon = makeTrayIcon(g_state);
     nid.hIcon = g_trayicon;
 
-    const WCHAR *txt = g_state == ST_WAITING ? L"Rojo - esperando confirmacion"
-                     : g_state == ST_RUNNING ? L"Amarillo - trabajando"
-                                             : L"Verde - listo";
-    _snwprintf(nid.szTip, 127, L"Claude Traffic Light v1.2.0\n%s", txt);
+    const WCHAR *txt = g_state == ST_WAITING ? L"Red - waiting for you"
+                     : g_state == ST_RUNNING ? L"Yellow - working"
+                                             : L"Green - ready";
+    if (g_portOk)
+        _snwprintf(nid.szTip, 127, L"Claude Traffic Light v1.3.0\n%s", txt);
+    else
+        _snwprintf(nid.szTip, 127,
+                   L"Claude Traffic Light v1.3.0\n%s\nPort %d busy: browser cannot connect",
+                   txt, g_port);
     nid.szTip[127] = 0;
 
     Shell_NotifyIconW(add ? NIM_ADD : NIM_MODIFY, &nid);
@@ -789,7 +807,9 @@ static void setState(int st, int watchMs)
 
     BOOL changed = (st != g_state);
     g_state = st;
-    trayUpdate(FALSE);
+    /* Solo si cambio: el navegador manda un latido por segundo y redibujar el
+       icono en cada uno es un ida y vuelta con el shell al pedo. */
+    if (changed) trayUpdate(FALSE);
     /* Recalculamos el foco en vez de confiar en el valor guardado: si nos
        perdimos algun evento de cambio de ventana, el guardado queda viejo y
        la luz no se muestra cuando deberia. */
@@ -806,7 +826,7 @@ static void setState(int st, int watchMs)
 
 static BOOL isClaudeWindow(HWND h)
 {
-    if (!h) return FALSE;
+    if (!h || h == g_hwnd) return FALSE;   /* nunca nosotros mismos */
     WCHAR title[512];
     int n = GetWindowTextW(h, title, 512);
     if (n <= 0) return FALSE;
@@ -876,6 +896,9 @@ static DWORD WINAPI httpThread(LPVOID arg)
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   /* solo 127.0.0.1 */
 
     if (bind(srv, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(srv, 8) != 0) {
+        /* Antes moria en silencio: la app arrancaba normal y el navegador no
+           lograba nada nunca, sin ninguna pista de por que. */
+        PostMessage(g_hwnd, WM_PORTFAIL, 0, 0);
         closesocket(srv);
         WSACleanup();
         return 0;
@@ -892,9 +915,18 @@ static DWORD WINAPI httpThread(LPVOID arg)
         int n = recv(c, buf, sizeof(buf) - 1, 0);
         if (n > 0) {
             buf[n] = 0;
+
+            /* Acotamos el parseo a la linea del pedido: buscar "s=" o "w=" en
+               todo el buffer tomaba tambien las cabeceras, y un Referer con
+               esos parametros bastaba para cambiar el estado. */
+            char *eol = strstr(buf, "\r\n");
+            if (eol) *eol = 0;
+            char *qs = strchr(buf, '?');
+            char *line = qs ? qs + 1 : buf;
+
             int st = -1;
-            char *p = strstr(buf, "s=");
-            if (!p) p = strstr(buf, "estado=");
+            char *p = strstr(line, "s=");
+            if (!p) p = strstr(line, "estado=");
             if (p) {
                 p = strchr(p, '=');
                 if (p) st = parseStateToken(p + 1);
@@ -904,7 +936,7 @@ static DWORD WINAPI httpThread(LPVOID arg)
                aca y no en el navegador, que estrangula los suyos cuando la
                pestana esta en segundo plano. */
             int watch = 0;
-            char *wp = strstr(buf, "w=");
+            char *wp = strstr(line, "w=");
             if (wp) watch = atoi(wp + 2);
             if (watch < 0) watch = 0;
             if (watch > 60000) watch = 60000;
@@ -915,7 +947,8 @@ static DWORD WINAPI httpThread(LPVOID arg)
             static const char *resp =
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: text/plain\r\n"
-                "Access-Control-Allow-Origin: *\r\n"
+                /* Solo claude.ai, en vez de cualquier sitio que visites. */
+                "Access-Control-Allow-Origin: https://claude.ai\r\n"
                 "Access-Control-Allow-Headers: *\r\n"
                 "Access-Control-Allow-Methods: GET,POST,OPTIONS\r\n"
                 /* permite que una pagina https hable con 127.0.0.1 sin extension */
@@ -939,19 +972,23 @@ static void showMenu(void)
     POINT pt;
     GetCursorPos(&pt);
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, ID_SHOW, L"Mostrar ahora");
+    AppendMenuW(m, MF_STRING, ID_SHOW, L"Show now");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING, ID_TEST_R, L"Probar rojo");
-    AppendMenuW(m, MF_STRING, ID_TEST_Y, L"Probar amarillo");
-    AppendMenuW(m, MF_STRING, ID_TEST_G, L"Probar verde");
+    AppendMenuW(m, MF_STRING, ID_TEST_R, L"Test red");
+    AppendMenuW(m, MF_STRING, ID_TEST_Y, L"Test yellow");
+    AppendMenuW(m, MF_STRING, ID_TEST_G, L"Test green");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING | (g_autostart ? MF_CHECKED : 0),
-                ID_AUTOSTART, L"Iniciar con Windows");
+                ID_AUTOSTART, L"Start with Windows");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING, ID_EXIT, L"Salir");
+    AppendMenuW(m, MF_STRING, ID_EXIT, L"Exit");
 
     SetForegroundWindow(g_hwnd);
     TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, g_hwnd, NULL);
+    /* La ventana tiene WS_EX_NOACTIVATE, asi que SetForegroundWindow no la
+       activa de verdad y el menu puede no cerrarse al clickear afuera. Este
+       mensaje vacio destraba la cola (KB135788). */
+    PostMessageW(g_hwnd, WM_NULL, 0, 0);
     DestroyMenu(m);
 }
 
@@ -961,6 +998,11 @@ static void showMenu(void)
 
 static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (msg == g_msgTaskbarCreated && g_msgTaskbarCreated) {
+        trayUpdate(TRUE);            /* Explorer volvio: re-agregamos el icono */
+        return 0;
+    }
+
     switch (msg) {
     case WM_TIMER:
         if (wp == TIMER_ANIM) onTimer();
@@ -1012,6 +1054,27 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         case ID_TEST_G:    setState(ST_DONE, 0);    showLight(); break;
         case ID_AUTOSTART: autostartSet(!g_autostart); break;
         case ID_EXIT:      DestroyWindow(h); break;
+        }
+        return 0;
+
+    case WM_PORTFAIL:
+        g_portOk = FALSE;
+        trayUpdate(FALSE);
+        {
+            NOTIFYICONDATAW nid;
+            ZeroMemory(&nid, sizeof(nid));
+            nid.cbSize = sizeof(nid);
+            nid.hWnd   = h;
+            nid.uID    = 1;
+            nid.uFlags = NIF_INFO;
+            nid.dwInfoFlags = NIIF_WARNING;
+            wcscpy(nid.szInfoTitle, L"Claude Traffic Light");
+            _snwprintf(nid.szInfo, 255,
+                       L"Port %d is already in use, so the browser userscript "
+                       L"cannot reach this app. Change \"port\" in the ini file "
+                       L"(and in the userscript) to a free one.", g_port);
+            nid.szInfo[255] = 0;
+            Shell_NotifyIconW(NIM_MODIFY, &nid);
         }
         return 0;
 
@@ -1132,9 +1195,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     g_hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST |
         WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        WND_CLASS, L"Semaforo Claude", WS_POPUP,
+        WND_CLASS, L"CTL status overlay", WS_POPUP,
         0, 0, g_w, g_h, NULL, NULL, inst, NULL);
     if (!g_hwnd) return 1;
+
+    /* Si Explorer se reinicia se lleva todos los iconos de la bandeja y hay
+       que volver a agregarlo, si no la app queda corriendo invisible. */
+    g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
     buildBitmaps();
     trayUpdate(TRUE);
@@ -1154,7 +1221,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE, NULL,
         winEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
-    CreateThread(NULL, 0, httpThread, NULL, 0, NULL);
+    HANDLE httpT = CreateThread(NULL, 0, httpThread, NULL, 0, NULL);
+    if (httpT) CloseHandle(httpT);   /* no lo esperamos: no lo retengamos */
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
