@@ -145,11 +145,18 @@ static void loadConfig(void)
     /* Se leen las claves en espanol y despues las mismas en ingles, en la
        seccion [semaforo] y en [traffic-light]. Gana la ultima que exista,
        asi los dos juegos de nombres funcionan y ninguno rompe al otro. */
+    /* Un valor no numerico hace que GetPrivateProfileIntW devuelva 0, y 0 no
+       es un valor sensato para ninguna de estas claves: antes un typo tipo
+       "size_pct = abc" encogia el semaforo al minimo en silencio. Si sale 0,
+       nos quedamos con lo que habia. */
+    #define CFG_ONE(var, sec, key)                                            \
+        { int v_ = GetPrivateProfileIntW(sec, key, 0, g_iniPath);             \
+          if (v_ != 0) var = v_; }
     #define CFG_INT(var, es, en)                                              \
-        var = GetPrivateProfileIntW(L"semaforo",      es, var, g_iniPath);    \
-        var = GetPrivateProfileIntW(L"semaforo",      en, var, g_iniPath);    \
-        var = GetPrivateProfileIntW(L"traffic-light", es, var, g_iniPath);    \
-        var = GetPrivateProfileIntW(L"traffic-light", en, var, g_iniPath);
+        CFG_ONE(var, L"semaforo",      es)                                    \
+        CFG_ONE(var, L"semaforo",      en)                                    \
+        CFG_ONE(var, L"traffic-light", es)                                    \
+        CFG_ONE(var, L"traffic-light", en)
 
     CFG_INT(g_port,          L"puerto",           L"port")
     CFG_INT(g_holdMs,        L"duracion_ms",      L"duration_ms")
@@ -162,6 +169,7 @@ static void loadConfig(void)
     CFG_INT(g_showOnBlur,    L"mostrar_al_salir", L"show_on_blur")
     CFG_INT(g_maxAlpha,      L"opacidad",         L"opacity")
     #undef CFG_INT
+    #undef CFG_ONE
 
     /* Para las cadenas se usa un centinela: si la clave no existe, el valor
        anterior se mantiene. Nunca se pasa el mismo buffer como origen y
@@ -170,7 +178,9 @@ static void loadConfig(void)
         {                                                                      \
             WCHAR tmp_[256];                                                   \
             GetPrivateProfileStringW(sec, key, L"\x01", tmp_, 256, g_iniPath); \
-            if (tmp_[0] != 1) { lstrcpynW(buf, tmp_, n); }                     \
+            /* vacio no cuenta: "title_match =" hacia que toda ventana pasara  \
+               por la de Claude y la luz no aparecia nunca */                  \
+            if (tmp_[0] != 1 && tmp_[0] != 0) { lstrcpynW(buf, tmp_, n); }     \
         }
 
     lstrcpynW(g_position, L"right",  32);
@@ -197,7 +207,7 @@ static void loadConfig(void)
     if (g_verticalPct < 0)   g_verticalPct = 0;
     if (g_verticalPct > 100) g_verticalPct = 100;
     if (g_scalePct < 40)   g_scalePct = 40;
-    if (g_scalePct > 400)  g_scalePct = 400;
+    if (g_scalePct > 250)  g_scalePct = 250;
     if (g_holdMs   < 300)  g_holdMs   = 300;
     if (g_holdMs   > 60000) g_holdMs  = 60000;
     if (g_maxAlpha < 30)   g_maxAlpha = 30;
@@ -574,10 +584,10 @@ static void trayUpdate(BOOL add)
                      : g_state == ST_RUNNING ? L"Yellow - working"
                                              : L"Green - ready";
     if (g_portOk)
-        _snwprintf(nid.szTip, 127, L"Claude Traffic Light v1.3.0\n%s", txt);
+        _snwprintf(nid.szTip, 127, L"Claude Traffic Light v1.4.0\n%s", txt);
     else
         _snwprintf(nid.szTip, 127,
-                   L"Claude Traffic Light v1.3.0\n%s\nPort %d busy: browser cannot connect",
+                   L"Claude Traffic Light v1.4.0\n%s\nPort %d busy: browser cannot connect",
                    txt, g_port);
     nid.szTip[127] = 0;
 
@@ -671,6 +681,13 @@ static void computePos(int *ox, int *oy)
         if (libre < 0) libre = 0;
         *oy = T + m + (int)((double)libre * g_verticalPct / 100.0 + 0.5);
     }
+
+    /* Ultimo recurso: que el rectangulo entre en el monitor pase lo que pase
+       (tamano exagerado, margen grande, resolucion chica). */
+    if (*ox + g_w > R) *ox = R - g_w;
+    if (*oy + g_h > B) *oy = B - g_h;
+    if (*ox < L) *ox = L;
+    if (*oy < T) *oy = T;
 }
 
 static void paintNow(void)
@@ -795,6 +812,15 @@ static void onTimer(void)
 
 static void setState(int st, int watchMs)
 {
+    /* 0xFF = latido sin color: refresca la vigilancia y nada mas. Antes, un
+       "w=" sin "s=" contestaba ok y no refrescaba nada. */
+    if (st == 0xFF) {
+        if (watchMs > 0 && g_state == ST_RUNNING) {
+            g_watchUntil = GetTickCount() + (DWORD)watchMs;
+            SetTimer(g_hwnd, TIMER_WATCH, 400, NULL);
+        }
+        return;
+    }
     if (st < 0 || st > 2) return;
 
     if (watchMs > 0 && st == ST_RUNNING) {
@@ -877,6 +903,135 @@ static int parseStateToken(const char *s)
     return -1;
 }
 
+/* Devuelve el valor de un parametro del query string. Antes se buscaba
+   "s=" con strstr, asi que "?bogus=red" o "/things=red" tambien cambiaban el
+   estado: cualquier parametro terminado en s servia. Ahora se compara la
+   clave entera entre separadores. */
+static const char *queryParam(const char *qs, const char *key)
+{
+    size_t klen = strlen(key);
+    const char *p = qs;
+    while (p && *p) {
+        const char *amp = strchr(p, '&');
+        if (!strncmp(p, key, klen) && p[klen] == '=')
+            return p + klen + 1;
+        if (!amp) break;
+        p = amp + 1;
+    }
+    return NULL;
+}
+
+/* Un pedido puede llegar partido en varios segmentos TCP. Con un solo recv,
+   si el primer pedazo no traia el parametro, la app contestaba "200 ok" y no
+   hacia nada: el navegador creia que habia avisado y la luz no cambiaba.
+   Leemos hasta el fin de cabeceras, hasta llenar el buffer o hasta el
+   timeout del socket. */
+static int recvRequest(SOCKET c, char *buf, int cap)
+{
+    int total = 0;
+    while (total < cap - 1) {
+        int n = recv(c, buf + total, cap - 1 - total, 0);
+        if (n <= 0) break;
+        total += n;
+        buf[total] = 0;
+        if (strstr(buf, "\r\n\r\n") || strstr(buf, "\n\n")) break;
+    }
+    if (total > 0) buf[total] = 0;
+    return total;
+}
+
+/* Devuelve TRUE si el pedido viene de una pagina que no es claude.ai.
+   Una etiqueta <img src="http://127.0.0.1:8787/?s=red"> en cualquier sitio
+   manda el pedido igual (la cabecera CORS solo impide LEER la respuesta, no
+   el efecto), pero el navegador incluye Origin o Referer y ahi se corta. Un
+   pedido sin ninguna de las dos -- curl, los hooks, el propio userscript --
+   pasa como siempre. */
+static BOOL fromForeignPage(const char *headers)
+{
+    static const char *keys[] = { "\nOrigin:", "\nreferer:", "\nOrigin:", "\nReferer:" };
+    for (int i = 0; i < 4; ++i) {
+        const char *h = strstr(headers, keys[i]);
+        if (!h) continue;
+        h += strlen(keys[i]);
+        while (*h == ' ') ++h;
+        if (!_strnicmp(h, "https://claude.ai", 17)) continue;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void handleConn(SOCKET c)
+{
+    DWORD tmo = 1500;
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof(tmo));
+
+    char buf[4096];
+    int n = recvRequest(c, buf, (int)sizeof(buf));
+    if (n > 0) {
+        /* separamos la linea del pedido de las cabeceras */
+        char *eol = strstr(buf, "\r\n");
+        if (!eol) eol = strchr(buf, '\n');
+        char headers[4096];
+        headers[0] = 0;
+        if (eol) {
+            lstrcpynA(headers, eol, (int)sizeof(headers));
+            *eol = 0;
+        }
+
+        BOOL isOptions = !_strnicmp(buf, "OPTIONS", 7);   /* preflight: sin efecto */
+        BOOL foreign   = fromForeignPage(headers);
+
+        if (!isOptions && !foreign) {
+            char *qs = strchr(buf, '?');
+            if (qs) {
+                const char *sv = queryParam(qs + 1, "s");
+                if (!sv) sv = queryParam(qs + 1, "estado");
+                const char *wv = queryParam(qs + 1, "w");
+
+                int st = sv ? parseStateToken(sv) : -1;
+
+                /* w=<ms> pide vigilancia: si no llega otro aviso en ese
+                   tiempo, el programa pasa a verde por su cuenta. El
+                   temporizador vive aca y no en el navegador, que estrangula
+                   los suyos cuando la pestana esta en segundo plano. */
+                int watch = wv ? atoi(wv) : 0;
+                if (watch < 0) watch = 0;
+                if (watch > 60000) watch = 60000;
+
+                if (st >= 0)
+                    PostMessage(g_hwnd, WM_SETSTATE, (WPARAM)st, (LPARAM)watch);
+                else if (watch > 0)
+                    PostMessage(g_hwnd, WM_SETSTATE, (WPARAM)0xFF, (LPARAM)watch);
+            }
+        }
+
+        static const char *resp =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            /* Solo claude.ai, en vez de cualquier sitio que visites. */
+            "Access-Control-Allow-Origin: https://claude.ai\r\n"
+            "Access-Control-Allow-Headers: *\r\n"
+            "Access-Control-Allow-Methods: GET,POST,OPTIONS\r\n"
+            /* permite que una pagina https hable con 127.0.0.1 sin extension */
+            "Access-Control-Allow-Private-Network: true\r\n"
+            "Access-Control-Max-Age: 600\r\n"
+            "Content-Length: 2\r\n"
+            "Connection: close\r\n\r\nok";
+        send(c, resp, (int)strlen(resp), 0);
+    }
+    shutdown(c, SD_BOTH);
+    closesocket(c);
+}
+
+static volatile LONG g_conns = 0;
+
+static DWORD WINAPI connThread(LPVOID p)
+{
+    handleConn((SOCKET)(UINT_PTR)p);
+    InterlockedDecrement(&g_conns);
+    return 0;
+}
+
 static DWORD WINAPI httpThread(LPVOID arg)
 {
     (void)arg;
@@ -895,7 +1050,7 @@ static DWORD WINAPI httpThread(LPVOID arg)
     a.sin_port   = htons((u_short)g_port);
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   /* solo 127.0.0.1 */
 
-    if (bind(srv, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(srv, 8) != 0) {
+    if (bind(srv, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(srv, 16) != 0) {
         /* Antes moria en silencio: la app arrancaba normal y el navegador no
            lograba nada nunca, sin ninguna pista de por que. */
         PostMessage(g_hwnd, WM_PORTFAIL, 0, 0);
@@ -908,58 +1063,17 @@ static DWORD WINAPI httpThread(LPVOID arg)
         SOCKET c = accept(srv, NULL, NULL);
         if (c == INVALID_SOCKET) { Sleep(50); continue; }
 
-        DWORD tmo = 1500;
-        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof(tmo));
-
-        char buf[2048];
-        int n = recv(c, buf, sizeof(buf) - 1, 0);
-        if (n > 0) {
-            buf[n] = 0;
-
-            /* Acotamos el parseo a la linea del pedido: buscar "s=" o "w=" en
-               todo el buffer tomaba tambien las cabeceras, y un Referer con
-               esos parametros bastaba para cambiar el estado. */
-            char *eol = strstr(buf, "\r\n");
-            if (eol) *eol = 0;
-            char *qs = strchr(buf, '?');
-            char *line = qs ? qs + 1 : buf;
-
-            int st = -1;
-            char *p = strstr(line, "s=");
-            if (!p) p = strstr(line, "estado=");
-            if (p) {
-                p = strchr(p, '=');
-                if (p) st = parseStateToken(p + 1);
-            }
-            /* w=<ms> pide vigilancia: si no llega otro aviso en ese tiempo,
-               el programa pasa a verde por su cuenta. El temporizador vive
-               aca y no en el navegador, que estrangula los suyos cuando la
-               pestana esta en segundo plano. */
-            int watch = 0;
-            char *wp = strstr(line, "w=");
-            if (wp) watch = atoi(wp + 2);
-            if (watch < 0) watch = 0;
-            if (watch > 60000) watch = 60000;
-
-            if (st >= 0)
-                PostMessage(g_hwnd, WM_SETSTATE, (WPARAM)st, (LPARAM)watch);
-
-            static const char *resp =
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/plain\r\n"
-                /* Solo claude.ai, en vez de cualquier sitio que visites. */
-                "Access-Control-Allow-Origin: https://claude.ai\r\n"
-                "Access-Control-Allow-Headers: *\r\n"
-                "Access-Control-Allow-Methods: GET,POST,OPTIONS\r\n"
-                /* permite que una pagina https hable con 127.0.0.1 sin extension */
-                "Access-Control-Allow-Private-Network: true\r\n"
-                "Access-Control-Max-Age: 600\r\n"
-                "Content-Length: 2\r\n"
-                "Connection: close\r\n\r\nok";
-            send(c, resp, (int)strlen(resp), 0);
+        /* Un hilo corto por conexion. Atendiendolas en fila, un cliente que
+           conectaba y no mandaba nada bloqueaba a todos los demas durante el
+           timeout completo. */
+        if (InterlockedIncrement(&g_conns) > 24) {
+            InterlockedDecrement(&g_conns);
+            closesocket(c);
+            continue;
         }
-        shutdown(c, SD_BOTH);
-        closesocket(c);
+        HANDLE th = CreateThread(NULL, 0, connThread, (LPVOID)(UINT_PTR)c, 0, NULL);
+        if (th) CloseHandle(th);
+        else { InterlockedDecrement(&g_conns); closesocket(c); }
     }
 }
 
@@ -1092,7 +1206,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 }
 
 /* ------------------------------------------------------------------ */
-/* Linea de comandos: semaforo.exe --estado running                    */
+/* Linea de comandos: claude-traffic-light.exe --state running         */
 /* ------------------------------------------------------------------ */
 
 static BOOL sendToRunning(const WCHAR *word)
@@ -1125,8 +1239,9 @@ static int handleCli(void)
     for (int i = 1; i < argc; ++i) {
         if ((!_wcsicmp(argv[i], L"--estado") || !_wcsicmp(argv[i], L"--state") ||
              !_wcsicmp(argv[i], L"-s")) && i + 1 < argc) {
-            sendToRunning(argv[i + 1]);
-            quit = 1;
+            /* 2 = no habia ninguna instancia a la que avisarle. Antes salia 0
+               siempre, asi que un script no podia distinguir exito de nada. */
+            quit = sendToRunning(argv[i + 1]) ? 1 : 2;
             break;
         }
         if (!_wcsicmp(argv[i], L"--mostrar") || !_wcsicmp(argv[i], L"--show")) {
@@ -1142,7 +1257,7 @@ static int handleCli(void)
         }
     }
     LocalFree(argv);
-    return quit;
+    return quit;   /* 0 = seguir arrancando, 1 = listo, 2 = no habia instancia */
 }
 
 /* ------------------------------------------------------------------ */
@@ -1154,7 +1269,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     (void)prev; (void)cmd; (void)show;
     g_inst = inst;
 
-    if (handleCli()) return 0;
+    int cli = handleCli();
+    if (cli) return (cli == 2) ? 1 : 0;
 
     HANDLE mtx = CreateMutexW(NULL, FALSE, APP_MUTEX);
     if (mtx && GetLastError() == ERROR_ALREADY_EXISTS) {
