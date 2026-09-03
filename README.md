@@ -36,14 +36,17 @@ is the same thing without the hardware.
 
 - **Native.** Plain Win32 in C. No Electron, no Python, no .NET, no runtime to
   install. One `.exe`, about 40 KB, ~3 MB of RAM.
-- **Idle means idle.** No polling loop. It sleeps on a system event
-  (`EVENT_SYSTEM_FOREGROUND`) and only draws while the light is on screen.
-  0% CPU the rest of the time.
+- **Idle means idle.** No polling loop. It sleeps on system events and only
+  draws while the light is on screen. (While the browser userscript is
+  actively reporting, it also handles one tiny loopback request per second —
+  only for as long as Claude is working.)
 - **Never in your way.** The window is click-through (`WS_EX_TRANSPARENT`) and
   never takes focus, so your mouse and keyboard behave as if it weren't there.
-- **Local only.** The HTTP listener binds to `127.0.0.1` and nothing is ever
-  sent anywhere. The only thing it reads from your system is the title of the
-  active window, to know whether you are looking at Claude.
+- **Local only.** The HTTP listener binds to `127.0.0.1`, is reachable only
+  from this machine, and accepts cross-origin calls from `https://claude.ai`
+  alone. Nothing is ever sent anywhere. The only thing it reads from your
+  system is the title of the active window, to know whether you are looking
+  at Claude.
 
 ---
 
@@ -152,6 +155,10 @@ running Claude Code and a `claude.ai` browser tab. If your terminal doesn't put
 "claude" in its title, point this at something that is in the title, such as
 your project name.
 
+It matches on any window, so beware the obvious false positive: an Explorer
+window or an editor showing the `claude-traffic-light` folder also has
+"claude" in its title, and counts as "the Claude window" while it is focused.
+
 The size scales with your display's DPI on top of `size_pct`, so it stays the
 same physical size across monitors.
 
@@ -187,7 +194,10 @@ copy — it just shows the running one.
 
 ## Building from source
 
-One file, no dependencies. With MinGW-w64 (Linux or Windows):
+One file, no dependencies. There is a script for each toolchain — `./build.sh`
+for MinGW-w64 and `build.cmd` for MSVC — or run the commands yourself.
+
+With MinGW-w64 (Linux or Windows):
 
 ```sh
 x86_64-w64-mingw32-gcc -O2 -municode -mwindows -o claude-traffic-light.exe \
@@ -281,6 +291,22 @@ setInterval(()=>{for(const b of document.querySelectorAll('button')){const k=(b.
 [...__new]
 ```
 
+## Spanish names still work
+
+The tool started out in Spanish and those names are still accepted, so an
+older setup keeps working after an upgrade:
+
+| English | Spanish alias |
+| --- | --- |
+| `traffic-light.ini` | `semaforo.ini` (used if the first one is absent) |
+| `[traffic-light]` | `[semaforo]` |
+| `position`, `vertical_pct`, `margin`, `size_pct` | `posicion`, `altura_pct`, `margen`, `tamano_pct` |
+| `duration_ms`, `opacity`, `port`, `title_match` | `duracion_ms`, `opacidad`, `puerto`, `titulo` |
+| `show_when_focused`, `show_on_blur` | `mostrar_con_foco`, `mostrar_al_salir` |
+| `--state`, `--show`, `--quit` | `--estado`, `--mostrar`, `--salir` |
+
+State names accept `rojo` / `amarillo` / `verde` as well.
+
 ## Known limitations
 
 - Windows only. The drawing and the window handling are pure Win32.
@@ -288,6 +314,11 @@ setInterval(()=>{for(const b of document.querySelectorAll('button')){const k=(b.
   it. The signals are listed above and the matching rules sit at the top of the
   userscript; the debugging recipe finds the new names in one pass.
 - The binary is unsigned, so expect a SmartScreen prompt on first run.
+- If port 8787 is already taken, the browser side cannot reach the app. It
+  says so in a notification and in the tray tooltip; change `port` in the ini
+  and the matching `PORT` in the userscript.
+- With two claude.ai tabs open the userscript coordinates them so an idle tab
+  doesn't cut the working one short. The bookmarklet has no such coordination.
 
 ## License
 
