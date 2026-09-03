@@ -35,6 +35,8 @@
 #define WM_TRAY        (WM_APP + 1)
 #define WM_SETSTATE    (WM_APP + 2)
 #define TIMER_ANIM     1
+#define TIMER_RAISE    2
+#define TIMER_WATCH    3
 
 #define ST_WAITING 0   /* rojo    */
 #define ST_RUNNING 1   /* amarillo*/
@@ -75,13 +77,15 @@ static int  g_alpha       = 0;        /* 0..255                        */
 static DWORD g_holdStart  = 0;
 static BOOL g_claudeFocus = FALSE;
 static BOOL g_autostart   = FALSE;
+static DWORD g_watchUntil = 0;   /* 0 = sin vigilancia */
 
 /* configuracion */
 static int   g_port          = 8787;
 static int   g_holdMs        = 4000;
 static int   g_fadeInMs      = 200;
 static int   g_fadeOutMs     = 450;
-static int   g_scalePct      = 100;
+static int   g_scalePct      = 75;
+static int   g_verticalPct   = 68;   /* 0 = arriba, 50 = centro, 100 = abajo */
 static int   g_margin        = 26;
 static int   g_showWhenFocus = 0;
 static int   g_showOnBlur    = 1;
@@ -145,6 +149,7 @@ static void loadConfig(void)
     CFG_INT(g_fadeInMs,      L"fade_in_ms",       L"fade_in_ms")
     CFG_INT(g_fadeOutMs,     L"fade_out_ms",      L"fade_out_ms")
     CFG_INT(g_scalePct,      L"tamano_pct",       L"size_pct")
+    CFG_INT(g_verticalPct,   L"altura_pct",       L"vertical_pct")
     CFG_INT(g_margin,        L"margen",           L"margin")
     CFG_INT(g_showWhenFocus, L"mostrar_con_foco", L"show_when_focused")
     CFG_INT(g_showOnBlur,    L"mostrar_al_salir", L"show_on_blur")
@@ -178,6 +183,8 @@ static void loadConfig(void)
     lowerW(g_position);
     lowerW(g_match);
 
+    if (g_verticalPct < 0)   g_verticalPct = 0;
+    if (g_verticalPct > 100) g_verticalPct = 100;
     if (g_scalePct < 40)   g_scalePct = 40;
     if (g_scalePct > 400)  g_scalePct = 400;
     if (g_holdMs   < 300)  g_holdMs   = 300;
@@ -188,6 +195,8 @@ static void loadConfig(void)
     if (g_fadeOutMs < 1)   g_fadeOutMs = 1;
     if (g_port < 1 || g_port > 65535) g_port = 8787;
 }
+
+static BOOL isClaudeWindow(HWND h);   /* definida mas abajo */
 
 /* ------------------------------------------------------------------ */
 /* Dibujo (BGRA premultiplicado, top-down)                             */
@@ -551,7 +560,7 @@ static void trayUpdate(BOOL add)
     const WCHAR *txt = g_state == ST_WAITING ? L"Rojo - esperando confirmacion"
                      : g_state == ST_RUNNING ? L"Amarillo - trabajando"
                                              : L"Verde - listo";
-    _snwprintf(nid.szTip, 127, L"Semaforo Claude\n%s", txt);
+    _snwprintf(nid.szTip, 127, L"Claude Traffic Light v1.2.0\n%s", txt);
     nid.szTip[127] = 0;
 
     Shell_NotifyIconW(add ? NIM_ADD : NIM_MODIFY, &nid);
@@ -637,7 +646,13 @@ static void computePos(int *ox, int *oy)
     *ox = left ? L + m : R - g_w - m;
     if (top)      *oy = T + m;
     else if (bot) *oy = B - g_h - m;
-    else          *oy = T + (B - T - g_h) / 2;
+    else {
+        /* vertical_pct recorre el alto util: 0 arriba, 50 centro, 100 abajo.
+           El centro exacto queda alto y molesta; por defecto va mas abajo. */
+        int libre = (B - T) - g_h - 2 * m;
+        if (libre < 0) libre = 0;
+        *oy = T + m + (int)((double)libre * g_verticalPct / 100.0 + 0.5);
+    }
 }
 
 static void paintNow(void)
@@ -674,6 +689,22 @@ static void assertTopmost(void)
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
 }
 
+/* Version fuerte, para el momento en que otra aplicacion se esta activando.
+   Sacar y volver a poner el flag topmost fuerza a Windows a reinsertar la
+   ventana arriba de todo en lugar de dejarla donde estaba.
+
+   NO se usa AttachThreadInput aca: engancharse a la cola de entrada de la
+   otra aplicacion hace falta para robar el foco, no para el z-order, y como
+   sincroniza teclado y mouse entre los dos procesos puede trabar clics en la
+   aplicacion de al lado. */
+static void forceTopmost(void)
+{
+    SetWindowPos(g_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+}
+
 static void showLight(void)
 {
     if (g_phase == PH_HIDDEN) {
@@ -681,7 +712,10 @@ static void showLight(void)
         paintNow();
         ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
     }
-    assertTopmost();
+    forceTopmost();
+    /* La activacion de la otra ventana puede completarse despues de esto,
+       asi que lo repetimos un rato mas tarde para ganarle a los rezagados. */
+    SetTimer(g_hwnd, TIMER_RAISE, 250, NULL);
     if (g_phase == PH_HIDDEN || g_phase == PH_OUT)
         g_phase = PH_IN;                 /* arrancar (o revertir) el fundido */
     else if (g_phase != PH_IN)
@@ -741,12 +775,25 @@ static void onTimer(void)
     }
 }
 
-static void setState(int st)
+static void setState(int st, int watchMs)
 {
     if (st < 0 || st > 2) return;
+
+    if (watchMs > 0 && st == ST_RUNNING) {
+        g_watchUntil = GetTickCount() + (DWORD)watchMs;
+        SetTimer(g_hwnd, TIMER_WATCH, 400, NULL);
+    } else {
+        g_watchUntil = 0;
+        KillTimer(g_hwnd, TIMER_WATCH);
+    }
+
     BOOL changed = (st != g_state);
     g_state = st;
     trayUpdate(FALSE);
+    /* Recalculamos el foco en vez de confiar en el valor guardado: si nos
+       perdimos algun evento de cambio de ventana, el guardado queda viejo y
+       la luz no se muestra cuando deberia. */
+    g_claudeFocus = isClaudeWindow(GetForegroundWindow());
     if (changed && (!g_claudeFocus || g_showWhenFocus))
         showLight();
     else if (changed && g_phase != PH_HIDDEN)
@@ -772,14 +819,23 @@ static void CALLBACK winEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
                                   DWORD thread, DWORD time)
 {
     (void)hook; (void)idChild; (void)thread; (void)time;
-    if (event != EVENT_SYSTEM_FOREGROUND || idObject != OBJID_WINDOW) return;
-    if (hwnd == g_hwnd) return;
+    if (idObject != OBJID_WINDOW || hwnd == g_hwnd) return;
+
+    if (event == EVENT_OBJECT_NAMECHANGE) {
+        /* Cambiar de pestana dentro del navegador NO cambia la ventana activa,
+           asi que EVENT_SYSTEM_FOREGROUND no se dispara. Lo unico que cambia es
+           el titulo de la ventana. Por eso escuchamos tambien los cambios de
+           titulo de la ventana que esta en primer plano. */
+        if (hwnd != GetForegroundWindow()) return;
+    } else if (event != EVENT_SYSTEM_FOREGROUND) {
+        return;
+    }
 
     BOOL now = isClaudeWindow(hwnd);
     if (g_claudeFocus && !now && g_showOnBlur)
         showLight();                 /* te fuiste de Claude -> avisar */
     else if (g_phase != PH_HIDDEN)
-        assertTopmost();             /* cambio de ventana: seguimos arriba */
+        forceTopmost();              /* cambio de ventana: seguimos arriba */
     g_claudeFocus = now;
 }
 
@@ -843,8 +899,18 @@ static DWORD WINAPI httpThread(LPVOID arg)
                 p = strchr(p, '=');
                 if (p) st = parseStateToken(p + 1);
             }
+            /* w=<ms> pide vigilancia: si no llega otro aviso en ese tiempo,
+               el programa pasa a verde por su cuenta. El temporizador vive
+               aca y no en el navegador, que estrangula los suyos cuando la
+               pestana esta en segundo plano. */
+            int watch = 0;
+            char *wp = strstr(buf, "w=");
+            if (wp) watch = atoi(wp + 2);
+            if (watch < 0) watch = 0;
+            if (watch > 60000) watch = 60000;
+
             if (st >= 0)
-                PostMessage(g_hwnd, WM_SETSTATE, (WPARAM)st, 0);
+                PostMessage(g_hwnd, WM_SETSTATE, (WPARAM)st, (LPARAM)watch);
 
             static const char *resp =
                 "HTTP/1.1 200 OK\r\n"
@@ -898,10 +964,23 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     switch (msg) {
     case WM_TIMER:
         if (wp == TIMER_ANIM) onTimer();
+        else if (wp == TIMER_WATCH) {
+            /* se acabo el tiempo sin noticias del navegador: damos por
+               terminado y pasamos a verde */
+            if (g_watchUntil && (LONG)(GetTickCount() - g_watchUntil) >= 0) {
+                KillTimer(h, TIMER_WATCH);
+                g_watchUntil = 0;
+                setState(ST_DONE, 0);
+            }
+        }
+        else if (wp == TIMER_RAISE) {
+            KillTimer(h, TIMER_RAISE);
+            if (g_phase != PH_HIDDEN) forceTopmost();
+        }
         return 0;
 
     case WM_SETSTATE:
-        setState((int)wp);
+        setState((int)wp, (int)lp);
         return 0;
 
     case WM_COPYDATA: {
@@ -914,7 +993,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             if (!_stricmp(tmp, "show")) showLight();
             else {
                 int st = parseStateToken(tmp);
-                if (st >= 0) setState(st);
+                if (st >= 0) setState(st, 0);
             }
         }
         return 1;
@@ -928,9 +1007,9 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case ID_SHOW:      showLight(); break;
-        case ID_TEST_R:    setState(ST_WAITING); showLight(); break;
-        case ID_TEST_Y:    setState(ST_RUNNING); showLight(); break;
-        case ID_TEST_G:    setState(ST_DONE);    showLight(); break;
+        case ID_TEST_R:    setState(ST_WAITING, 0); showLight(); break;
+        case ID_TEST_Y:    setState(ST_RUNNING, 0); showLight(); break;
+        case ID_TEST_G:    setState(ST_DONE, 0);    showLight(); break;
         case ID_AUTOSTART: autostartSet(!g_autostart); break;
         case ID_EXIT:      DestroyWindow(h); break;
         }
@@ -1069,6 +1148,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, NULL,
         winEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
+    /* Segundo enganche: cambios de titulo, que es como se detecta el cambio
+       de pestana dentro de un mismo navegador. */
+    HWINEVENTHOOK hookName = SetWinEventHook(
+        EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE, NULL,
+        winEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
     CreateThread(NULL, 0, httpThread, NULL, 0, NULL);
 
     MSG msg;
@@ -1078,6 +1163,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     }
 
     if (hook) UnhookWinEvent(hook);
+    if (hookName) UnhookWinEvent(hookName);
     if (mtx)  CloseHandle(mtx);
     return 0;
 }
