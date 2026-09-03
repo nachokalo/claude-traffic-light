@@ -120,7 +120,8 @@ tab after the page loads.
 
 Browser detection reads the page, so it's less exact than the Claude Code
 hooks: yellow and green are reliable, red only shows when a permission dialog
-actually appears.
+actually appears. [How it detects browser state](#how-it-detects-browser-state)
+explains what it looks at, and how to debug it if claude.ai changes.
 
 ---
 
@@ -132,8 +133,9 @@ actually appears.
 ```ini
 [traffic-light]
 position          = right   ; right, left, top-right, bottom-right, top-left, bottom-left
+vertical_pct      = 68      ; 0 = top, 50 = centred, 100 = bottom (right/left only)
 margin            = 26      ; distance from the screen edge, in pixels
-size_pct          = 100     ; 70 = smaller, 140 = bigger
+size_pct          = 75      ; 100 = original size, 140 = bigger
 duration_ms       = 4000    ; how long it stays before fading out
 fade_in_ms        = 200
 fade_out_ms       = 450
@@ -152,6 +154,11 @@ your project name.
 
 The size scales with your display's DPI on top of `size_pct`, so it stays the
 same physical size across monitors.
+
+`vertical_pct` exists because a vertically centred badge lands right where you
+tend to be looking. The default sits it below the middle, out of the way but
+still in peripheral vision. It only applies to `right` and `left`; the corner
+positions place themselves.
 
 ---
 
@@ -203,17 +210,83 @@ blended window — no image assets, and it stays sharp at any DPI or scale.
 - A `SetWinEventHook` on `EVENT_SYSTEM_FOREGROUND` tells the app whenever the
   active window changes. Leaving a window whose title matches `title_match`
   triggers the light.
+- A second hook on `EVENT_OBJECT_NAMECHANGE` catches **tab** switches. Moving
+  between tabs in one browser window is not a window change as far as Windows
+  is concerned — the only thing that changes is the window's title — so
+  without this, leaving the claude.ai tab for another tab went unnoticed.
+- The window reclaims the top of the z-order when shown, on every frame while
+  visible, and on foreground changes. It is shown at the exact moment another
+  application is being activated, and that race is easy to lose. It does *not*
+  use `AttachThreadInput` for this: input-queue attachment is needed to steal
+  focus, not to reorder windows, and it can block clicks in the other app.
 - State arrives either through `WM_COPYDATA` (the `--state` command line, used
   by the Claude Code hooks) or through the loopback HTTP listener (used by the
   browser userscript).
 - A state change shows the light too, unless you're currently looking at
   Claude — configurable with `show_when_focused`.
 
+## How it detects browser state
+
+Claude Code reports its state directly through hooks, so that path is exact.
+The browser has no such API, so the userscript infers it — and getting this
+right took considerably more work than the drawing did. What it uses, in
+order of confidence:
+
+1. **The stop button.** While Claude answers, the composer's send button is
+   replaced by a "Stop response" one. This is the strongest signal because it
+   stays there through the silent pauses when Claude is thinking between
+   steps. Matching is anchored to the start of the label and capped in length:
+   a message that merely *mentions* the word "stop" ends up inside the
+   "message actions" button's label, and a loose match would read that as a
+   permanent stop button.
+2. **The tool status pill.** Present while a tool runs, which is another
+   stretch where nothing else on the page moves.
+3. **A turn latch.** Once either of the above is seen, the turn is held open
+   until the composer's own send button returns. Without this, every quiet gap
+   read as "finished" and the light flickered yellow-green-yellow.
+4. **DOM activity, as a fallback.** While an answer is being written the page
+   mutates many times per second. Changes inside editable regions and buttons
+   are ignored (typing a message, the send button lighting up), and a few
+   batches in a row are required, so one isolated change doesn't count.
+
+**The completion timeout lives in the desktop app, not in the browser.** While
+Claude works the userscript sends `running` as a heartbeat with `&w=2500`; if
+that heartbeat stops for that long, the app turns green on its own. Browsers
+throttle timers in background tabs — sometimes to once a minute — which is
+exactly when the light matters, so the countdown cannot live there.
+
+### Debugging it
+
+If claude.ai changes and the light stops tracking, the userscript publishes its
+state as an attribute on `<html>`. In the browser console on claude.ai:
+
+```js
+document.documentElement.dataset.semaforo
+```
+
+It returns what the script currently thinks: what it is reporting, whether it
+found the stop button and which label matched, whether a turn is open, and the
+last element that changed. It is written to the DOM rather than exposed as a
+function because userscripts run in an isolated world — in Edge, even
+`unsafeWindow` doesn't bridge it.
+
+To find the current name of the stop button, snapshot the buttons while idle
+and diff them against the buttons present while Claude works:
+
+```js
+window.__base=new Set([...document.querySelectorAll('button')].map(b=>(b.getAttribute('aria-label')||'')+' | '+(b.getAttribute('data-testid')||'')));
+window.__new=new Set();
+setInterval(()=>{for(const b of document.querySelectorAll('button')){const k=(b.getAttribute('aria-label')||'')+' | '+(b.getAttribute('data-testid')||'');if(!__base.has(k))__new.add(k)}},300);
+// ask Claude something long, then:
+[...__new]
+```
+
 ## Known limitations
 
 - Windows only. The drawing and the window handling are pure Win32.
-- Browser state is inferred from the DOM, so a claude.ai redesign can break it.
-  The selectors live at the top of the userscript and are easy to patch.
+- Browser state is inferred from the page, so a claude.ai redesign can break
+  it. The signals are listed above and the matching rules sit at the top of the
+  userscript; the debugging recipe finds the new names in one pass.
 - The binary is unsigned, so expect a SmartScreen prompt on first run.
 
 ## License
