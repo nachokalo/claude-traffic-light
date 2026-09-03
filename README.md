@@ -42,9 +42,11 @@ is the same thing without the hardware.
   only for as long as Claude is working.)
 - **Never in your way.** The window is click-through (`WS_EX_TRANSPARENT`) and
   never takes focus, so your mouse and keyboard behave as if it weren't there.
-- **Local only.** The HTTP listener binds to `127.0.0.1`, is reachable only
-  from this machine, and accepts cross-origin calls from `https://claude.ai`
-  alone. Nothing is ever sent anywhere. The only thing it reads from your
+- **Local only.** The HTTP listener binds to `127.0.0.1`, so it is reachable
+  only from this machine. Requests carrying an `Origin` or `Referer` from any
+  page other than `https://claude.ai` are ignored, which is what stops a
+  random site from driving your light with an `<img>` tag. Nothing is ever
+  sent anywhere. The only thing it reads from your
   system is the title of the active window, to know whether you are looking
   at Claude.
 
@@ -189,6 +191,12 @@ GET http://127.0.0.1:8787/state?s=running
 Accepted values: `waiting` / `red`, `running` / `yellow` / `busy`,
 `done` / `green` / `idle`. Launching a second instance doesn't start a second
 copy — it just shows the running one.
+
+`--state` exits with 0 if it reached a running instance and 1 if there was
+none, so a script can tell whether the light actually got the message.
+
+`w` on its own, with no `s`, refreshes the watchdog without changing the
+colour — that is what the browser heartbeat uses.
 
 ---
 
