@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude Traffic Light (claude.ai)
 // @namespace    claude-traffic-light
-// @version      3.0
+// @version      3.1
 // @description  Reports claude.ai's state to the Claude Traffic Light desktop app
 // @match        https://claude.ai/*
 // @match        https://*.claude.ai/*
@@ -57,11 +57,18 @@
   // Every tab reports independently, so an idle one used to send "done"
   // while another was still working and knock the light green.
   let otherTabBusyUntil = 0;
+  let composerRoot = null;
+  const startedAt = Date.now();
   let channel = null;
   try {
     channel = new BroadcastChannel('claude-traffic-light');
     channel.onmessage = function (e) {
-      if (e && e.data && e.data.busy) otherTabBusyUntil = Date.now() + 5000;
+      if (!e || !e.data || !e.data.busy) return;
+      otherTabBusyUntil = Date.now() + 5000;
+      // Cuando vence, volver a mirar enseguida en vez de esperar al resync:
+      // si la otra pestana se cerro a mitad de respuesta, si no tardabamos
+      // hasta 15 s en poder decir que termino.
+      setTimeout(function () { check(true); }, 5100);
     };
   } catch (e) { /* no BroadcastChannel: each tab is on its own */ }
 
@@ -85,17 +92,26 @@
     // Another tab is mid-answer: not our place to say it finished.
     if (state === 'done' && now < otherTabBusyUntil) return;
 
-    const heartbeat = (state === 'running');
-    if (heartbeat && channel) {
+    // Una pestana recien abierta no opina hasta enterarse de que hacen las
+    // otras: si no, anunciaba "done" en el instante de cargar, encima de otra
+    // pestana que estaba en plena respuesta.
+    if (state === 'done' && now - startedAt < 1500) return;
+
+    // El rojo tambien ocupa la luz: antes solo se difundia el amarillo, asi
+    // que una pestana ociosa pisaba con verde el rojo de otra.
+    const holds = (state === 'running' || state === 'waiting');
+    if (holds && channel) {
       try { channel.postMessage({ busy: true }); } catch (e) {}
     }
 
-    const due = now - lastSentAt >= (heartbeat ? HEARTBEAT_MS - 150 : RESYNC_MS);
+    const due = now - lastSentAt >= (holds ? HEARTBEAT_MS - 150 : RESYNC_MS);
     if (state === last && !due) return;
 
     last = state;
     lastSentAt = now;
-    send(state, heartbeat ? WATCH_MS : 0);
+    // El rojo tambien se manda con vigilancia: si cerras la pestana con el
+    // cartel de permiso abierto, algo tiene que devolver la luz a verde.
+    send(state, holds ? WATCH_MS : 0);
   }
 
   const label = (el) =>
@@ -118,11 +134,18 @@
   // Only inside a dialog. Scanning every button on the page meant a settings
   // toggle reading "Allow analytics" pinned the light red forever.
   function waitingForYou() {
+    // Mirando el texto entero del dialogo, un cartel de cookies o un mensaje
+    // que dijera "allow me to explain" alcanzaba para dejar la luz en rojo.
+    // El permiso se pide con un boton, asi que miramos los botones.
     for (const d of document.querySelectorAll('[role="dialog"], [role="alertdialog"]')) {
       if (!visible(d)) continue;
-      const txt = (d.textContent || '').toLowerCase();
-      if (/\ballow\b|\bapprove\b|grant access|\bpermitir\b|\baprobar\b/.test(txt))
-        return true;
+      for (const b of d.querySelectorAll('button')) {
+        const l = ((b.getAttribute('aria-label') || b.textContent) || '')
+                    .toLowerCase().trim();
+        if (!l || l.length > 40) continue;
+        if (/^(allow|approve|grant|permitir|aprobar|autorizar)\b/.test(l))
+          return true;
+      }
     }
     return false;
   }
@@ -140,7 +163,12 @@
   const STOP_LABEL_MAX = 40;
 
   function positiveSignal() {
-    for (const b of document.querySelectorAll('button')) {
+    // Buscamos primero dentro del compositor, que es donde el boton de enviar
+    // se convierte en el de detener. Sin eso, un "Stop sharing screen" de otra
+    // extension dejaba la luz amarilla para siempre.
+    const scope = (composerRoot && document.contains(composerRoot))
+                    ? composerRoot : document;
+    for (const b of scope.querySelectorAll('button')) {
       const l = label(b);
       if (!l || l.length > STOP_LABEL_MAX) continue;
       if (!STOP_WORDS.test(l.toLowerCase())) continue;
@@ -162,7 +190,15 @@
 
   function sendButtonVisible() {
     const b = document.querySelector('[data-testid="chat-input-send"]');
-    return !!(b && visible(b));
+    if (!b || !visible(b)) return false;
+    // Nos guardamos donde vive el compositor mientras podemos verlo.
+    let root = b.closest('form');
+    if (!root) {
+      root = b;
+      for (let i = 0; i < 4 && root.parentElement; i++) root = root.parentElement;
+    }
+    composerRoot = root;
+    return true;
   }
 
   // ---- YELLOW, signal 2: the answer is physically being written ------
@@ -215,6 +251,11 @@
       }
     }
 
+    // El respaldo por actividad solo vale si el compositor NO esta listo para
+    // escribir: con el boton de enviar a la vista, Claude no esta respondiendo,
+    // y cualquier cosa que refresque texto cada tanto (un reloj relativo en el
+    // panel lateral, un aviso) alcanzaba para dejarlo amarillo indefinidamente.
+    if (sendButtonVisible()) return false;
     return streak >= STREAK_NEEDED && (now - lastBusyAt) < QUIET_MS;
   }
 
@@ -227,7 +268,7 @@
   function publishDebug(positive) {
     try {
       document.documentElement.setAttribute('data-semaforo', JSON.stringify({
-        v: '3.0',
+        v: '3.1',
         reportando: last,
         msDesdeActividad: lastBusyAt ? Date.now() - lastBusyAt : null,
         racha: streak,
