@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude Traffic Light (claude.ai)
 // @namespace    claude-traffic-light
-// @version      2.0
+// @version      3.0
 // @description  Reports claude.ai's state to the Claude Traffic Light desktop app
 // @match        https://claude.ai/*
 // @match        https://*.claude.ai/*
@@ -17,37 +17,57 @@
   // Must match "port" in traffic-light.ini
   const PORT = 8787;
 
-  // How long after the last sign of activity we call it "done", in ms.
+  // While Claude works we send "running" as a heartbeat and ask the app to
+  // fall back to green if it stops arriving. The countdown lives in the app
+  // because browsers throttle timers in background tabs — but for the same
+  // reason the window has to be generous: a throttled tab can go a while
+  // without sending anything. The explicit "done" below is the fast path;
+  // this is only the safety net.
+  const WATCH_MS = 20000;
+  const HEARTBEAT_MS = 1200;
+
+  // Re-send the current state this often even when nothing changed, so the
+  // app picks the state up again after being restarted.
+  const RESYNC_MS = 15000;
+
+  // Fallback signal: how long after the last page activity we call it done.
   const QUIET_MS = 1600;
 
-  // While Claude is writing we keep sending "running" as a heartbeat, and we
-  // ask the desktop app to fall back to green if the heartbeat stops for this
-  // long. The countdown lives in the app on purpose: browsers throttle timers
-  // in background tabs, which is exactly when this has to be right.
-  const WATCH_MS = 2500;
-  const HEARTBEAT_MS = 700;
-
-  // A single isolated change is not Claude working: opening the composer,
-  // a placeholder disappearing or a thumbnail appearing each move the page
-  // once. A real answer being written moves it many times per second, so we
-  // only call it "running" after a few batches in a row.
+  // A single isolated change is not Claude working: opening the composer, a
+  // placeholder disappearing or a thumbnail appearing each move the page once.
+  // A real answer moves it many times per second.
   const STREAK_NEEDED = 3;
 
-  let last = null;
+  // Once a positive sign is seen the turn is held open, so silent gaps while
+  // Claude thinks between steps don't read as "finished".
+  const TURN_GRACE_MS = 8000;
+
+  let last = 'done';        // assume idle: a tab that just loaded must not
+                            // announce "done" over another tab's work
   let lastSentAt = 0;
   let lastBusyAt = 0;
+  let lastCheckAt = 0;
   let streak = 0;
-  let doneTimer = null;
+  let inTurn = false;
+  let lastPositiveAt = 0;
+  let signal = '';
+  let lastPath = '';
 
-  function report(state) {
-    const now = Date.now();
-    const heartbeat = (state === 'running');
-    if (state === last && !(heartbeat && now - lastSentAt >= HEARTBEAT_MS)) return;
-    last = state;
-    lastSentAt = now;
+  // ---- Several tabs open at once -------------------------------------
+  // Every tab reports independently, so an idle one used to send "done"
+  // while another was still working and knock the light green.
+  let otherTabBusyUntil = 0;
+  let channel = null;
+  try {
+    channel = new BroadcastChannel('claude-traffic-light');
+    channel.onmessage = function (e) {
+      if (e && e.data && e.data.busy) otherTabBusyUntil = Date.now() + 5000;
+    };
+  } catch (e) { /* no BroadcastChannel: each tab is on its own */ }
 
+  function send(state, watchMs) {
     const url = 'http://127.0.0.1:' + PORT + '/state?s=' + state +
-                (heartbeat ? '&w=' + WATCH_MS : '');
+                (watchMs ? '&w=' + watchMs : '');
     try {
       GM_xmlhttpRequest({
         method: 'GET',
@@ -59,27 +79,29 @@
     } catch (e) { /* app not running: stay quiet */ }
   }
 
-  const text = (el) =>
-    ((el && (el.getAttribute('aria-label') || el.textContent)) || '')
-      .toLowerCase().trim();
+  function report(state) {
+    const now = Date.now();
 
-  // ---- RED: something is waiting for your confirmation ---------------
-  function waitingForYou() {
-    const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"]');
-    for (const d of dialogs) {
-      if (/allow|approve|grant access|always allow|permitir|aprobar|autoriz/.test(text(d)))
-        return true;
+    // Another tab is mid-answer: not our place to say it finished.
+    if (state === 'done' && now < otherTabBusyUntil) return;
+
+    const heartbeat = (state === 'running');
+    if (heartbeat && channel) {
+      try { channel.postMessage({ busy: true }); } catch (e) {}
     }
-    for (const b of document.querySelectorAll('button')) {
-      if (/^(allow|approve|always allow|permitir|aprobar)/.test(text(b)))
-        return true;
-    }
-    return false;
+
+    const due = now - lastSentAt >= (heartbeat ? HEARTBEAT_MS - 150 : RESYNC_MS);
+    if (state === last && !due) return;
+
+    last = state;
+    lastSentAt = now;
+    send(state, heartbeat ? WATCH_MS : 0);
   }
 
-  // ---- YELLOW, signal 1: the stop button, or a running tool ------------
-  // These stay present during the quiet gaps while Claude thinks between
-  // steps, which is exactly when the activity heartbeat below goes silent.
+  const label = (el) =>
+    ((el && (el.getAttribute('aria-label') || el.getAttribute('data-testid'))) || '')
+      .trim();
+
   function visible(el) {
     if (!el) return false;
     // NOT offsetParent: it is null for anything inside a position:fixed
@@ -90,68 +112,70 @@
     return st.visibility !== 'hidden' && st.display !== 'none' && st.opacity !== '0';
   }
 
-  // The real button is called exactly "Detener respuesta" / "Stop response":
-  // short, and starting with the verb. Matching the word anywhere in the label
-  // was a trap - the "message actions" button embeds the whole message text in
-  // its label, so any message merely MENTIONING the word looked like the stop
-  // button, and the light stayed yellow forever.
-  const STOP_WORDS = /^(detener|stop|parar|deten[e\u00e9]|cancelar|cancel)\b/;
+  const inDialog = (el) => !!el.closest('[role="dialog"], [role="alertdialog"]');
+
+  // ---- RED: something is waiting for your confirmation ---------------
+  // Only inside a dialog. Scanning every button on the page meant a settings
+  // toggle reading "Allow analytics" pinned the light red forever.
+  function waitingForYou() {
+    for (const d of document.querySelectorAll('[role="dialog"], [role="alertdialog"]')) {
+      if (!visible(d)) continue;
+      const txt = (d.textContent || '').toLowerCase();
+      if (/\ballow\b|\bapprove\b|grant access|\bpermitir\b|\baprobar\b/.test(txt))
+        return true;
+    }
+    return false;
+  }
+
+  // ---- YELLOW, signal 1: the stop button, or a running tool ----------
+  // These stay present through the silent gaps while Claude thinks between
+  // steps, which is exactly when the activity heartbeat below goes quiet.
+  //
+  // The label must START with the verb and be short: the "message actions"
+  // button embeds the whole message text in its label, so a loose match read
+  // any message mentioning the word as a permanent stop button. And buttons
+  // inside a dialog are skipped — "Cancel" in a modal is not Claude working,
+  // which is also why "cancel" is not in this list at all.
+  const STOP_WORDS = /^(detener|stop|parar|deten[eé])\b/;
   const STOP_LABEL_MAX = 40;
 
-  let stopLabel = '';
-  // Once we have seen a positive sign we consider a turn to be in progress and
-  // hold it, instead of falling back to green in every silent gap. The turn is
-  // closed when the composer's own send button is back, or after a long
-  // silence as a safety net.
-  let inTurn = false;
-  let lastPositiveAt = 0;
-  const TURN_GRACE_MS = 8000;
+  function positiveSignal() {
+    for (const b of document.querySelectorAll('button')) {
+      const l = label(b);
+      if (!l || l.length > STOP_LABEL_MAX) continue;
+      if (!STOP_WORDS.test(l.toLowerCase())) continue;
+      if (inDialog(b)) continue;
+      if (visible(b)) { signal = 'stop-button'; return true; }
+    }
+
+    for (const pill of document.querySelectorAll('[data-testid="tool-status-pill"]')) {
+      const txt = (pill.textContent || '').toLowerCase();
+      if (visible(pill) && /ejecutando|running|executing/.test(txt)) {
+        signal = 'tool-status-pill';
+        return true;
+      }
+    }
+
+    signal = '';
+    return false;
+  }
 
   function sendButtonVisible() {
     const b = document.querySelector('[data-testid="chat-input-send"]');
     return !!(b && visible(b));
   }
 
-  function stopButtonVisible() {
-    for (const b of document.querySelectorAll('button')) {
-      const label = (b.getAttribute('aria-label') ||
-                     b.getAttribute('data-testid') || '').trim();
-      if (!label || label.length > STOP_LABEL_MAX) continue;
-      if (!STOP_WORDS.test(label.toLowerCase())) continue;
-      if (visible(b)) { stopLabel = label; return true; }
-    }
-
-    // A tool running counts too: the status pill sits there through the pause.
-    for (const pill of document.querySelectorAll('[data-testid="tool-status-pill"]')) {
-      const txt = (pill.textContent || '').toLowerCase();
-      if (visible(pill) && /ejecutando|running|executing/.test(txt)) {
-        stopLabel = 'tool-status-pill';
-        return true;
-      }
-    }
-    stopLabel = '';
-    return false;
-  }
-
   // ---- YELLOW, signal 2: the answer is physically being written ------
-  // Markup-independent: while Claude streams a reply, text nodes change
-  // many times per second. When it stops, the page goes quiet. This keeps
-  // working even if claude.ai redesigns everything.
-  // Typing also mutates the DOM: the text itself, and the send button, the
-  // Enter hint, the box growing around it. We drop anything that happens
-  // inside an editable region, walking up from the mutated node itself.
-  // isContentEditable is inherited, so it is true for the <p> elements the
-  // editor creates, whatever the attribute literally says.
+  // Markup-independent fallback: while Claude streams, text nodes change many
+  // times per second. Anything inside an editable region or a button is
+  // ignored — that is the user typing, or the send button lighting up.
   function insideEditor(node) {
     let el = node && (node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement);
     for (let i = 0; el && i < 25; i++, el = el.parentElement) {
       if (el.isContentEditable) return true;
       const tag = el.tagName;
-      if (tag === 'TEXTAREA' || tag === 'INPUT' || tag === 'FORM') return true;
-      // Claude never streams its answer inside a button, so anything changing
-      // in one is chrome reacting to the user: the send button lighting up,
-      // an icon swapping, a tooltip. Never a sign that Claude is working.
-      if (tag === 'BUTTON') return true;
+      if (tag === 'TEXTAREA' || tag === 'INPUT' || tag === 'FORM' || tag === 'BUTTON')
+        return true;
       if (el.hasAttribute && el.hasAttribute('contenteditable')) return true;
       const role = el.getAttribute && el.getAttribute('role');
       if (role === 'textbox' || role === 'button') return true;
@@ -159,8 +183,6 @@
     return false;
   }
 
-  // Last element that changed, for diagnostics.
-  let lastPath = '';
   function describe(node) {
     const el = node && (node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement);
     if (!el) return '(none)';
@@ -175,24 +197,64 @@
     return bits.join(' > ');
   }
 
+  function busy(positive) {
+    const now = Date.now();
+
+    if (positive) {
+      inTurn = true;
+      lastPositiveAt = now;
+      return true;
+    }
+
+    if (inTurn) {
+      const quiet = now - lastPositiveAt;
+      if ((sendButtonVisible() && quiet > 1500) || quiet > TURN_GRACE_MS) {
+        inTurn = false;
+      } else {
+        return true;               /* bridging a silent gap */
+      }
+    }
+
+    return streak >= STREAK_NEEDED && (now - lastBusyAt) < QUIET_MS;
+  }
+
   // Diagnostics are published as an attribute on <html>. Userscripts run in an
   // isolated world - in Edge even unsafeWindow does not bridge it - but the DOM
   // is shared, so this is readable from the page console with:
   //     document.documentElement.dataset.semaforo
-  function publishDebug() {
+  // Only the KIND of signal is published, never the button's own text: labels
+  // can carry file names or fragments of the conversation.
+  function publishDebug(positive) {
     try {
       document.documentElement.setAttribute('data-semaforo', JSON.stringify({
-        v: '2.0',
+        v: '3.0',
         reportando: last,
         msDesdeActividad: lastBusyAt ? Date.now() - lastBusyAt : null,
         racha: streak,
-        botonStop: stopButtonVisible(),
-        senal: stopLabel,
+        senal: positive ? signal : '',
         turnoEnCurso: inTurn,
         botonEnviar: sendButtonVisible(),
+        otraPestanaTrabajando: Date.now() < otherTabBusyUntil,
         ultimoCambio: lastPath
       }));
     } catch (e) {}
+  }
+
+  // One pass over the buttons per check, shared by busy() and the diagnostics:
+  // this used to scan the whole page twice, forcing layout each time, dozens
+  // of times a second on a long conversation.
+  function check(force) {
+    const now = Date.now();
+    if (!force && now - lastCheckAt < 200) return;
+    lastCheckAt = now;
+
+    const positive = positiveSignal();
+
+    if (waitingForYou())        report('waiting');
+    else if (busy(positive))    report('running');
+    else                        report('done');
+
+    publishDebug(positive);
   }
 
   function noteActivity(records) {
@@ -213,6 +275,7 @@
       }
       if (streaming) break;
     }
+
     if (streaming) {
       const now = Date.now();
       if (now - lastBusyAt > 1500) streak = 0;   /* se corto: volvemos a cero */
@@ -220,42 +283,7 @@
       lastBusyAt = now;
       lastPath = describe(streamingTarget);
     }
-    check();
-    if (!streaming) return;
-
-    // Re-check once the page has been quiet, so we can turn green even if
-    // the tab is in the background and interval timers get throttled.
-    clearTimeout(doneTimer);
-    doneTimer = setTimeout(check, QUIET_MS + 200);
-  }
-
-  function busy() {
-    const now = Date.now();
-
-    if (stopButtonVisible()) {          /* stop button or a running tool */
-      inTurn = true;
-      lastPositiveAt = now;
-      return true;
-    }
-
-    if (inTurn) {
-      const quiet = now - lastPositiveAt;
-      // The composer's send button coming back is the reliable end of turn.
-      if ((sendButtonVisible() && quiet > 1500) || quiet > TURN_GRACE_MS) {
-        inTurn = false;
-      } else {
-        return true;                    /* bridging a silent gap */
-      }
-    }
-
-    return streak >= STREAK_NEEDED && (now - lastBusyAt) < QUIET_MS;
-  }
-
-  function check() {
-    if (waitingForYou())  report('waiting');
-    else if (busy())      report('running');
-    else                  report('done');
-    publishDebug();
+    check(false);
   }
 
   new MutationObserver(noteActivity).observe(document.documentElement, {
@@ -264,9 +292,8 @@
     characterData: true
   });
 
-  setInterval(check, 700);
-  document.addEventListener('visibilitychange', check);
+  setInterval(function () { check(true); }, HEARTBEAT_MS);
+  document.addEventListener('visibilitychange', function () { check(true); });
 
-  check();
-
+  check(true);
 })();

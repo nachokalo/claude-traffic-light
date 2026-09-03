@@ -4,10 +4,13 @@ Use this if you can't install browser extensions (a locked-down work machine,
 for example). It's a bookmark that connects the current claude.ai tab to the
 traffic light.
 
-**Difference from the userscript:** the userscript runs by itself every time
+**Differences from the userscript.** The userscript runs by itself every time
 you open claude.ai; the bookmarklet has to be clicked once per tab, after the
-page loads. As long as you don't reload, it keeps working for the whole
-session.
+page loads, and again after every reload. It uses the same signals to read
+Claude's state (the stop button, the tool status pill, and page activity) and
+sends the same heartbeat, so the light returns to green on its own if you
+close the tab mid-answer. What it does not have is the coordination between
+several open tabs, so with two claude.ai tabs at once the light can flicker.
 
 ## Install
 
@@ -27,7 +30,7 @@ session.
 ## The line
 
 ```
-javascript:(function(){var P=8787,u=null,t=null;if(window.__ctl){alert('Traffic light already active in this tab');return}window.__ctl=1;function send(s){if(s===u)return;u=s;fetch('http://127.0.0.1:'+P+'/state?s='+s,{mode:'no-cors'}).catch(function(){})}function tx(e){return((e&&((e.getAttribute&&e.getAttribute('aria-label'))||e.textContent))||'').toLowerCase().trim()}function wait(){var d=document.querySelectorAll('[role=dialog],[role=alertdialog]'),i;for(i=0;i<d.length;i++){if(/allow|approve|grant access|permitir|aprobar|autoriz/.test(tx(d[i])))return 1}var b=document.querySelectorAll('button');for(i=0;i<b.length;i++){if(/^(allow|approve|permitir|aprobar)/.test(tx(b[i])))return 1}return 0}function busy(){var s=document.querySelector('button[aria-label*=Stop i],button[aria-label*=Detener i],[data-testid=stop-button]');if(s&&s.offsetParent!==null)return 1;return document.querySelector('[aria-busy=true],[data-is-streaming=true]')?1:0}function chk(){t=null;send(wait()?'waiting':(busy()?'running':'done'))}function sched(){if(!t)t=setTimeout(chk,250)}new MutationObserver(sched).observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['aria-label','aria-busy','data-is-streaming','disabled']});setInterval(chk,5000);chk();alert('Traffic light connected to this tab')})()
+javascript:(function(){var P=8787,W=20000,u=null,t=null,hb=0;if(window.__ctl){alert('Traffic light already active in this tab');return}window.__ctl=1;function send(s,w){try{fetch('http://127.0.0.1:'+P+'/state?s='+s+(w?'&w='+w:''),{mode:'no-cors'}).catch(function(){})}catch(e){}}function rep(s){var n=Date.now();var h=(s==='running');if(s===u&&!(h&&n-hb>=1200))return;u=s;hb=n;send(s,h?W:0)}function lab(e){return((e&&(e.getAttribute('aria-label')||e.getAttribute('data-testid')))||'').trim()}function vis(e){if(!e)return 0;if(e.getClientRects().length===0)return 0;var s=getComputedStyle(e);return s.visibility!=='hidden'&&s.display!=='none'&&s.opacity!=='0'}function dlg(e){return!!e.closest('[role=dialog],[role=alertdialog]')}function wait(){var d=document.querySelectorAll('[role=dialog],[role=alertdialog]');for(var i=0;i<d.length;i++){if(!vis(d[i]))continue;var x=(d[i].textContent||'').toLowerCase();if(/\ballow\b|\bapprove\b|grant access|\bpermitir\b|\baprobar\b/.test(x))return 1}return 0}function pos(){var b=document.querySelectorAll('button');for(var i=0;i<b.length;i++){var l=lab(b[i]);if(!l||l.length>40)continue;if(!/^(detener|stop|parar)\b/.test(l.toLowerCase()))continue;if(dlg(b[i]))continue;if(vis(b[i]))return 1}var p=document.querySelectorAll('[data-testid=tool-status-pill]');for(i=0;i<p.length;i++){if(vis(p[i])&&/ejecutando|running|executing/.test((p[i].textContent||'').toLowerCase()))return 1}return 0}function chk(){t=null;rep(wait()?'waiting':(pos()?'running':'done'))}function sch(){if(!t)t=setTimeout(chk,250)}new MutationObserver(sch).observe(document.documentElement,{childList:true,subtree:true,characterData:true});setInterval(chk,1200);chk();alert('Traffic light connected to this tab')})()
 ```
 
 ## If it doesn't work
