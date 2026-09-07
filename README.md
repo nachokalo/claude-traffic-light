@@ -35,20 +35,27 @@ is the same thing without the hardware.
 ## Design goals
 
 - **Native.** Plain Win32 in C. No Electron, no Python, no .NET, no runtime to
-  install. One `.exe`, about 40 KB, ~3 MB of RAM.
-- **Idle means idle.** No polling loop. It sleeps on system events and only
-  draws while the light is on screen. (While the browser userscript is
-  actively reporting, it also handles one tiny loopback request per second —
-  only for as long as Claude is working.)
+  install. One `.exe`, about 50 KB, ~3 MB of RAM.
+- **Idle means idle.** No polling loop and no timers of its own while nothing
+  is happening: it sleeps on system events and only draws while the light is
+  on screen. The browser side does talk to it — about one loopback request a
+  second while Claude is working, and four a minute the rest of the time, as a
+  keep-alive so a restarted app picks the state back up.
 - **Never in your way.** The window is click-through (`WS_EX_TRANSPARENT`) and
   never takes focus, so your mouse and keyboard behave as if it weren't there.
-- **Local only.** The HTTP listener binds to `127.0.0.1`, so it is reachable
-  only from this machine. Requests carrying an `Origin` or `Referer` from any
-  page other than `https://claude.ai` are ignored, which is what stops a
-  random site from driving your light with an `<img>` tag. Nothing is ever
-  sent anywhere. The only thing it reads from your
-  system is the title of the active window, to know whether you are looking
-  at Claude.
+- **Local only.** The HTTP listener binds to `127.0.0.1`, so nothing outside
+  this machine can reach it, and nothing is ever sent anywhere. The only thing
+  it reads from your system is the title of the active window, to know whether
+  you are looking at Claude.
+- **Best-effort about other web pages.** Any page you visit can also send
+  requests to `127.0.0.1`, so the app filters them: a request is dropped if its
+  `Origin` or `Referer` is a page other than `https://claude.ai`, if
+  `Sec-Fetch-Dest` says it came from an embedded tag such as `<img>` rather
+  than a `fetch`, or if its headers did not arrive complete. Those signals come
+  from the browser, so treat this as a filter and not a guarantee — a request
+  with no headers at all is accepted, because that is what the Claude Code
+  hooks and the userscript look like. The worst a page could do with it is
+  change the colour of a decorative light.
 
 ---
 
@@ -95,6 +102,15 @@ It edits `%USERPROFILE%\.claude\settings.json`, keeps a backup next to it, and
 leaves any hooks you already had from other tools alone. **Open a new Claude
 Code session afterwards** — hooks are read at startup.
 
+The hooks store an absolute path to the executable. If you run the installer
+straight from an unpacked download, that path points into your Downloads
+folder and the hooks break the day you clean it up. Point it at wherever you
+actually keep the exe:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File claude-code\install-hooks.ps1 -Exe "C:\Tools\ClaudeTrafficLight\claude-traffic-light.exe"
+```
+
 The mapping it installs:
 
 | Claude Code hook | State |
@@ -123,10 +139,14 @@ hand.
 See [`browser/bookmarklet.md`](browser/bookmarklet.md). You click it once per
 tab after the page loads.
 
-Browser detection reads the page, so it's less exact than the Claude Code
-hooks: yellow and green are reliable, red only shows when a permission dialog
-actually appears. [How it detects browser state](#how-it-detects-browser-state)
-explains what it looks at, and how to debug it if claude.ai changes.
+Browser detection reads the page, so it is less exact than the Claude Code
+hooks: it reports yellow and green, and never red. Red is a claim that Claude
+is blocked waiting for *you*, and the browser cannot know that reliably — every
+attempt to infer it from dialogs ended up mistaking a cookie banner or a
+settings toggle for a permission prompt and pinning the light red. The hooks
+know it for certain, so red comes from there.
+[How it detects browser state](#how-it-detects-browser-state) explains what it
+looks at, and how to debug it if claude.ai changes.
 
 ---
 
@@ -193,10 +213,13 @@ Accepted values: `waiting` / `red`, `running` / `yellow` / `busy`,
 copy — it just shows the running one.
 
 `--state` exits with 0 if it reached a running instance and 1 if there was
-none, so a script can tell whether the light actually got the message.
+none, so a script can tell whether the light actually got the message. `-s`
+is a short alias for it.
 
 `w` on its own, with no `s`, refreshes the watchdog without changing the
-colour — that is what the browser heartbeat uses.
+colour. Nothing in this repo sends that form — the browser heartbeat always
+sends the state too — but it is there if you drive the light from your own
+script.
 
 ---
 
@@ -245,18 +268,20 @@ blended window — no image assets, and it stays sharp at any DPI or scale.
 
 ## How it detects browser state
 
-Claude Code reports its state directly through hooks, so that path is exact.
-The browser has no such API, so the userscript infers it — and getting this
-right took considerably more work than the drawing did. What it uses, in
-order of confidence:
+Claude Code reports its state directly through hooks, so that path is exact
+and it is the only one that produces red. The browser has no such API, so the
+userscript infers yellow and green — and getting this right took considerably
+more work than the drawing did. What it uses, in order of confidence:
 
 1. **The stop button.** While Claude answers, the composer's send button is
    replaced by a "Stop response" one. This is the strongest signal because it
    stays there through the silent pauses when Claude is thinking between
-   steps. Matching is anchored to the start of the label and capped in length:
-   a message that merely *mentions* the word "stop" ends up inside the
-   "message actions" button's label, and a loose match would read that as a
-   permanent stop button.
+   steps. It is only looked for inside the composer, which the script learns
+   from whichever of the two buttons it sees first: searching the whole page
+   meant a "Stop sharing" button from a screen-sharing bar could hold the
+   light yellow forever. Matching is anchored to the start of the label and
+   capped in length, because a message that merely *mentions* the word ends up
+   inside the "message actions" button's label.
 2. **The tool status pill.** Present while a tool runs, which is another
    stretch where nothing else on the page moves.
 3. **A turn latch.** Once either of the above is seen, the turn is held open
@@ -264,11 +289,15 @@ order of confidence:
    read as "finished" and the light flickered yellow-green-yellow.
 4. **DOM activity, as a fallback.** While an answer is being written the page
    mutates many times per second. Changes inside editable regions and buttons
-   are ignored (typing a message, the send button lighting up), and a few
-   batches in a row are required, so one isolated change doesn't count.
+   are ignored (typing a message, the send button lighting up), and the
+   batches have to be dense — a sidebar timestamp refreshing every second and
+   a half does not count, which it used to.
+
+With several claude.ai tabs open they coordinate over a `BroadcastChannel`, so
+an idle tab cannot announce "done" over another tab's answer.
 
 **The completion timeout lives in the desktop app, not in the browser.** While
-Claude works the userscript sends `running` as a heartbeat with `&w=2500`; if
+Claude works the userscript sends `running` as a heartbeat with `&w=20000`; if
 that heartbeat stops for that long, the app turns green on its own. Browsers
 throttle timers in background tabs — sometimes to once a minute — which is
 exactly when the light matters, so the countdown cannot live there.
@@ -282,9 +311,10 @@ state as an attribute on `<html>`. In the browser console on claude.ai:
 document.documentElement.dataset.semaforo
 ```
 
-It returns what the script currently thinks: what it is reporting, whether it
-found the stop button and which label matched, whether a turn is open, and the
-last element that changed. It is written to the DOM rather than exposed as a
+It returns what the script currently thinks: what it is reporting, which kind
+of signal it is going on, whether a turn is open, and the last element that
+changed. It deliberately does not publish the button's own label — those can
+carry file names or fragments of the conversation. It is written to the DOM rather than exposed as a
 function because userscripts run in an isolated world — in Edge, even
 `unsafeWindow` doesn't bridge it.
 
@@ -324,7 +354,7 @@ State names accept `rojo` / `amarillo` / `verde` as well.
 - The binary is unsigned, so expect a SmartScreen prompt on first run.
 - If port 8787 is already taken, the browser side cannot reach the app. It
   says so in a notification and in the tray tooltip; change `port` in the ini
-  and the matching `PORT` in the userscript.
+  and the matching `PORT` in the userscript (or `P` in the bookmarklet).
 - With two claude.ai tabs open the userscript coordinates them so an idle tab
   doesn't cut the working one short. The bookmarklet has no such coordination.
 
