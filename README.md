@@ -35,7 +35,7 @@ is the same thing without the hardware.
 ## Design goals
 
 - **Native.** Plain Win32 in C. No Electron, no Python, no .NET, no runtime to
-  install. One `.exe`, about 54 KB, ~3 MB of RAM.
+  install. One `.exe`, about 50 KB, ~3 MB of RAM.
 - **Idle means idle.** No polling loop and no timers of its own while nothing
   is happening: it sleeps on system events and only draws while the light is
   on screen. The browser side does talk to it — about one loopback request a
@@ -246,6 +246,28 @@ The traffic light is drawn pixel by pixel into a 32-bit premultiplied BGRA
 buffer and blitted with `UpdateLayeredWindow`, so it's a real shaped, alpha
 blended window — no image assets, and it stays sharp at any DPI or scale.
 
+## Checking that it works
+
+`verify.ps1` runs the whole thing against itself and prints a PASS/FAIL table:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File verify.ps1
+```
+
+It starts the app if it isn't running, exercises the local server (including
+the requests that are supposed to be *ignored*), checks every exit code, and
+puts the hook installer through fifteen scenarios — a fresh profile, a profile
+that already has hooks from another tool, invalid JSON, repeated runs — all
+inside a throwaway folder under `%TEMP%`, so your real `settings.json` is never
+touched.
+
+The last few checks are the ones no script can answer on its own: whether the
+light actually appears when you leave the Claude window, whether the tray icon
+is there, and whether it lands correctly on a second monitor or at a non-100%
+display scale. It asks you those as yes/no questions. `-Quick` skips them.
+
+It exits 0 when everything passed and 1 otherwise, so it can gate a release.
+
 ## How it decides what to show
 
 - A `SetWinEventHook` on `EVENT_SYSTEM_FOREGROUND` tells the app whenever the
@@ -297,7 +319,7 @@ With several claude.ai tabs open they coordinate over a `BroadcastChannel`, so
 an idle tab cannot announce "done" over another tab's answer.
 
 **The completion timeout lives in the desktop app, not in the browser.** While
-Claude works the userscript sends `running` as a heartbeat with `&w=90000`; if
+Claude works the userscript sends `running` as a heartbeat with `&w=20000`; if
 that heartbeat stops for that long, the app turns green on its own. Browsers
 throttle timers in background tabs — sometimes to once a minute — which is
 exactly when the light matters, so the countdown cannot live there.
