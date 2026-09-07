@@ -8,7 +8,7 @@
  *   YELLOW -> Claude is working
  *   GREEN  -> done, ready for a new task
  *
- * Plain Win32: no runtime, no dependencies, ~40 KB, 0% CPU when idle.
+ * Plain Win32: no runtime, no dependencies, ~50 KB, idle when idle.
  *
  * MIT licensed. See LICENSE.
  */
@@ -28,6 +28,7 @@
 #include <shellapi.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
@@ -149,9 +150,39 @@ static void loadConfig(void)
        es un valor sensato para ninguna de estas claves: antes un typo tipo
        "size_pct = abc" encogia el semaforo al minimo en silencio. Si sale 0,
        nos quedamos con lo que habia. */
+    /* Leemos el valor como texto y solo lo usamos si es un numero. Antes se
+       descartaba todo lo que diera 0, para no comerse un typo -- pero eso se
+       llevaba puesto al 0 legitimo, que es un valor documentado y util:
+       "show_on_blur = 0", "vertical_pct = 0" y "margin = 0" no hacian nada. */
     #define CFG_ONE(var, sec, key)                                            \
-        { int v_ = GetPrivateProfileIntW(sec, key, 0, g_iniPath);             \
-          if (v_ != 0) var = v_; }
+        {                                                                     \
+            WCHAR raw_[64];                                                   \
+            const WCHAR *q_;                                                  \
+            BOOL num_;                                                        \
+            GetPrivateProfileStringW(sec, key, L"", raw_, 64, g_iniPath);     \
+            q_ = raw_;                                                        \
+            while (*q_ == L' ' || *q_ == L'\t') ++q_;                         \
+            if (*q_ == L'+') ++q_;                /* "+7" es 7 */            \
+            num_ = (*q_ == L'-' && q_[1] >= L'0' && q_[1] <= L'9') ||         \
+                   (*q_ >= L'0' && *q_ <= L'9');                              \
+            if (num_) {                                                       \
+                const WCHAR *w_ = q_ + (*q_ == L'-' ? 1 : 0);                 \
+                for (; *w_; ++w_) {                                           \
+                    if (*w_ >= L'0' && *w_ <= L'9') continue;                 \
+                    /* espacio o ; = fin del numero, pero solo si lo que      \
+                       sigue no son mas digitos: "4 2" es un typo, no un 4 */ \
+                    if (*w_ == L' ' || *w_ == L'\t' || *w_ == L';') {         \
+                        const WCHAR *r_ = w_;                                 \
+                        while (*r_ == L' ' || *r_ == L'\t') ++r_;             \
+                        if (*r_ >= L'0' && *r_ <= L'9') num_ = FALSE;         \
+                        break;                                                \
+                    }                                                         \
+                    num_ = FALSE;                                             \
+                    break;                                                    \
+                }                                                             \
+            }                                                                 \
+            if (num_) var = _wtoi(q_);                                        \
+        }
     #define CFG_INT(var, es, en)                                              \
         CFG_ONE(var, L"semaforo",      es)                                    \
         CFG_ONE(var, L"semaforo",      en)                                    \
@@ -584,10 +615,10 @@ static void trayUpdate(BOOL add)
                      : g_state == ST_RUNNING ? L"Yellow - working"
                                              : L"Green - ready";
     if (g_portOk)
-        _snwprintf(nid.szTip, 127, L"Claude Traffic Light v1.4.0\n%s", txt);
+        _snwprintf(nid.szTip, 127, L"Claude Traffic Light v1.4.2\n%s", txt);
     else
         _snwprintf(nid.szTip, 127,
-                   L"Claude Traffic Light v1.4.0\n%s\nPort %d busy: browser cannot connect",
+                   L"Claude Traffic Light v1.4.2\n%s\nPort %d busy: browser cannot connect",
                    txt, g_port);
     nid.szTip[127] = 0;
 
@@ -926,37 +957,74 @@ static const char *queryParam(const char *qs, const char *key)
    hacia nada: el navegador creia que habia avisado y la luz no cambiaba.
    Leemos hasta el fin de cabeceras, hasta llenar el buffer o hasta el
    timeout del socket. */
-static int recvRequest(SOCKET c, char *buf, int cap)
+static int recvRequest(SOCKET c, char *buf, int cap, BOOL *complete)
 {
     int total = 0;
+    *complete = FALSE;
     while (total < cap - 1) {
         int n = recv(c, buf + total, cap - 1 - total, 0);
         if (n <= 0) break;
         total += n;
         buf[total] = 0;
-        if (strstr(buf, "\r\n\r\n") || strstr(buf, "\n\n")) break;
+        if (strstr(buf, "\r\n\r\n") || strstr(buf, "\n\n")) { *complete = TRUE; break; }
     }
     if (total > 0) buf[total] = 0;
     return total;
 }
 
-/* Devuelve TRUE si el pedido viene de una pagina que no es claude.ai.
-   Una etiqueta <img src="http://127.0.0.1:8787/?s=red"> en cualquier sitio
-   manda el pedido igual (la cabecera CORS solo impide LEER la respuesta, no
-   el efecto), pero el navegador incluye Origin o Referer y ahi se corta. Un
-   pedido sin ninguna de las dos -- curl, los hooks, el propio userscript --
-   pasa como siempre. */
+/* Busca una cabecera por nombre, al principio de linea y sin distinguir
+   mayusculas. La version anterior hacia strstr de "\nOrigin:" con la tabla
+   mal escrita (repetida en un caso, sin la variante en minusculas en otro) y
+   ademas comparaba por prefijo, asi que "https://claude.ai.evil.com" pasaba
+   por bueno. */
+static const char *headerValue(const char *headers, const char *name)
+{
+    size_t nlen = strlen(name);
+    const char *p = headers;
+    while (p && *p) {
+        while (*p == '\r' || *p == '\n') ++p;
+        if (!_strnicmp(p, name, nlen) && p[nlen] == ':') {
+            const char *v = p + nlen + 1;
+            while (*v == ' ' || *v == '\t') ++v;
+            return v;
+        }
+        p = strchr(p, '\n');
+        if (p) ++p;
+    }
+    return NULL;
+}
+
+static BOOL originAllowed(const char *v)
+{
+    static const char host[] = "https://claude.ai";
+    size_t n = sizeof(host) - 1;
+    if (_strnicmp(v, host, n) != 0) return FALSE;
+    /* Tiene que terminar ahi o seguir con un separador: sin esto,
+       "https://claude.ai.evil.com" contaba como claude.ai. */
+    char c = v[n];
+    return c == 0 || c == '/' || c == '?' || c == '#' || c == ':' ||
+           c == '\r' || c == '\n' || c == ' ' || c == '\t';
+}
+
+/* TRUE si el pedido viene de una pagina que no es claude.ai. Una etiqueta
+   <img src="http://127.0.0.1:8787/?s=red"> en cualquier sitio manda el pedido
+   igual (la cabecera CORS solo impide LEER la respuesta, no el efecto), pero
+   el navegador incluye Origin o Referer y ahi se corta. Un pedido sin ninguna
+   de las dos -- curl, los hooks, el propio userscript -- pasa como siempre. */
 static BOOL fromForeignPage(const char *headers)
 {
-    static const char *keys[] = { "\nOrigin:", "\nreferer:", "\nOrigin:", "\nReferer:" };
-    for (int i = 0; i < 4; ++i) {
-        const char *h = strstr(headers, keys[i]);
-        if (!h) continue;
-        h += strlen(keys[i]);
-        while (*h == ' ') ++h;
-        if (!_strnicmp(h, "https://claude.ai", 17)) continue;
-        return TRUE;
-    }
+    /* Origin y Referer solos no alcanzan: una <img> no manda Origin, y el
+       Referer se pierde al bajar de https a http, que es justo nuestro caso.
+       Sec-Fetch-Dest si viaja siempre en los navegadores actuales y dice para
+       que se pidio el recurso: "empty" es fetch/XHR, cualquier otra cosa
+       (image, script, style, iframe...) es una etiqueta incrustada. */
+    const char *d = headerValue(headers, "Sec-Fetch-Dest");
+    if (d && _strnicmp(d, "empty", 5) != 0) return TRUE;
+
+    const char *v = headerValue(headers, "Origin");
+    if (v) return !originAllowed(v);
+    v = headerValue(headers, "Referer");
+    if (v) return !originAllowed(v);
     return FALSE;
 }
 
@@ -966,7 +1034,23 @@ static void handleConn(SOCKET c)
     setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof(tmo));
 
     char buf[4096];
-    int n = recvRequest(c, buf, (int)sizeof(buf));
+    BOOL complete = FALSE;
+    int n = recvRequest(c, buf, (int)sizeof(buf), &complete);
+
+    /* Si no llego el bloque de cabeceras entero, no se actua. Sin esto, una
+       URL de 4 KB llenaba el buffer, no aparecia el fin de cabeceras, y el
+       Origin quedaba fuera de lo leido: el filtro no veia ninguna cabecera y
+       dejaba pasar el pedido. Una <img> con relleno alcanzaba para saltearlo. */
+    if (n > 0 && !complete) {
+        static const char *bad =
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n"
+            "Connection: close\r\n\r\n";
+        send(c, bad, (int)strlen(bad), 0);
+        shutdown(c, SD_BOTH);
+        closesocket(c);
+        return;
+    }
+
     if (n > 0) {
         /* separamos la linea del pedido de las cabeceras */
         char *eol = strstr(buf, "\r\n");
@@ -1039,7 +1123,7 @@ static DWORD WINAPI httpThread(LPVOID arg)
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 0;
 
     SOCKET srv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (srv == INVALID_SOCKET) return 0;
+    if (srv == INVALID_SOCKET) { WSACleanup(); return 0; }
 
     BOOL yes = TRUE;
     setsockopt(srv, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&yes, sizeof(yes));
@@ -1209,6 +1293,8 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 /* Linea de comandos: claude-traffic-light.exe --state running         */
 /* ------------------------------------------------------------------ */
 
+static int parseStateToken(const char *s);   /* definida mas abajo */
+
 static BOOL sendToRunning(const WCHAR *word)
 {
     HWND target = FindWindowW(WND_CLASS, NULL);
@@ -1218,6 +1304,10 @@ static BOOL sendToRunning(const WCHAR *word)
     int i = 0;
     for (; word[i] && i < 63; ++i) ascii[i] = (char)(word[i] & 0x7F);
     ascii[i] = 0;
+
+    /* Un estado que no existe se rechaza aca, para que el codigo de salida
+       distinga "no llego" de "no lo entendi". */
+    if (_stricmp(ascii, "show") && parseStateToken(ascii) < 0) return FALSE;
 
     COPYDATASTRUCT cds;
     cds.dwData = 1;
@@ -1237,24 +1327,29 @@ static int handleCli(void)
 
     int quit = 0;
     for (int i = 1; i < argc; ++i) {
-        if ((!_wcsicmp(argv[i], L"--estado") || !_wcsicmp(argv[i], L"--state") ||
-             !_wcsicmp(argv[i], L"-s")) && i + 1 < argc) {
-            /* 2 = no habia ninguna instancia a la que avisarle. Antes salia 0
-               siempre, asi que un script no podia distinguir exito de nada. */
+        if (!_wcsicmp(argv[i], L"--estado") || !_wcsicmp(argv[i], L"--state") ||
+            !_wcsicmp(argv[i], L"-s")) {
+            /* Sin valor era peor que un error: se ignoraba el flag y arrancaba
+               la ventana, asi que un script con la variable vacia dejaba un
+               proceso de fondo en vez de fallar. */
+            if (i + 1 >= argc) { quit = 2; break; }
+            /* 2 = no llego a destino: no habia instancia, o el estado no
+               existe. Antes cualquier texto salia 0 y el script no podia
+               distinguir un typo de un exito. */
             quit = sendToRunning(argv[i + 1]) ? 1 : 2;
             break;
         }
         if (!_wcsicmp(argv[i], L"--mostrar") || !_wcsicmp(argv[i], L"--show")) {
-            sendToRunning(L"show");
-            quit = 1;
+            quit = sendToRunning(L"show") ? 1 : 2;
             break;
         }
         if (!_wcsicmp(argv[i], L"--salir") || !_wcsicmp(argv[i], L"--quit")) {
             HWND t = FindWindowW(WND_CLASS, NULL);
             if (t) PostMessageW(t, WM_CLOSE, 0, 0);
-            quit = 1;
+            quit = t ? 1 : 2;
             break;
         }
+        if (argv[i][0] == L'-') { quit = 2; break; }   /* flag desconocido */
     }
     LocalFree(argv);
     return quit;   /* 0 = seguir arrancando, 1 = listo, 2 = no habia instancia */
