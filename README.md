@@ -35,7 +35,7 @@ is the same thing without the hardware.
 ## Design goals
 
 - **Native.** Plain Win32 in C. No Electron, no Python, no .NET, no runtime to
-  install. One `.exe`, about 50 KB, ~3 MB of RAM.
+  install. One `.exe`, about 54 KB, ~3 MB of RAM.
 - **Idle means idle.** No polling loop and no timers of its own while nothing
   is happening: it sleeps on system events and only draws while the light is
   on screen. The browser side does talk to it — about one loopback request a
