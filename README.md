@@ -35,7 +35,7 @@ is the same thing without the hardware.
 ## Design goals
 
 - **Native.** Plain Win32 in C. No Electron, no Python, no .NET, no runtime to
-  install. One `.exe`, about 50 KB, ~3 MB of RAM.
+  install. One `.exe`, about 54 KB, ~3 MB of RAM.
 - **Idle means idle.** No polling loop and no timers of its own while nothing
   is happening: it sleeps on system events and only draws while the light is
   on screen. The browser side does talk to it — about one loopback request a
@@ -319,7 +319,7 @@ With several claude.ai tabs open they coordinate over a `BroadcastChannel`, so
 an idle tab cannot announce "done" over another tab's answer.
 
 **The completion timeout lives in the desktop app, not in the browser.** While
-Claude works the userscript sends `running` as a heartbeat with `&w=20000`; if
+Claude works the userscript sends `running` as a heartbeat with `&w=90000`; if
 that heartbeat stops for that long, the app turns green on its own. Browsers
 throttle timers in background tabs — sometimes to once a minute — which is
 exactly when the light matters, so the countdown cannot live there.
