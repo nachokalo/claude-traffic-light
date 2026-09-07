@@ -1,5 +1,5 @@
 {
-  "_comment": "Paste the contents of \"hooks\" into %USERPROFILE%\\.claude\\settings.json. Replace C:\\\\Tools\\\\ClaudeTrafficLight\\\\claude-traffic-light.exe with the real path. Or just run install-hooks.cmd and let it do this for you.",
+  "_comment": "Paste the contents of \"hooks\" into %USERPROFILE%\\.claude\\settings.json. Replace the C:\\Tools\\ClaudeTrafficLight path below with wherever you keep the exe, keeping the doubled backslashes that JSON requires. Or just run install-hooks.cmd and let it do this for you.",
 
   "hooks": {
     "SessionStart": [

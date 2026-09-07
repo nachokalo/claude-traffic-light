@@ -68,21 +68,13 @@ if ($Remove -and -not (Test-Path -LiteralPath $cfg)) {
 if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
 
 # --- read settings.json ---------------------------------------------
+# Nothing is backed up and nothing is written until we know the file actually
+# has to change: an earlier version copied a .bak on every run, so running the
+# installer five times left five backups in the user's .claude folder.
+$original = $null
 if (Test-Path -LiteralPath $cfg) {
-    # Keep the FIRST backup forever: re-running this used to overwrite it with
-    # the already-modified file, so the pristine original was lost.
-    $backup = "$cfg.backup-traffic-light"
-    if (-not (Test-Path -LiteralPath $backup)) {
-        Copy-Item $cfg $backup
-        Write-Host "Original backed up to $backup" -ForegroundColor DarkGray
-    } else {
-        $stamped = "$cfg." + (Get-Date -Format 'yyyyMMdd-HHmmss') + ".bak"
-        Copy-Item $cfg $stamped
-        Write-Host "Backup of the current file: $stamped" -ForegroundColor DarkGray
-        Write-Host "(the untouched original is still at $backup)" -ForegroundColor DarkGray
-    }
-
-    $raw = Get-Content $cfg -Raw
+    $raw = Get-Content -LiteralPath $cfg -Raw
+    $original = $raw
     if ([string]::IsNullOrWhiteSpace($raw)) {
         $json = [pscustomobject]@{}
     } else {
@@ -92,7 +84,7 @@ if (Test-Path -LiteralPath $cfg) {
             Write-Host ""
             Write-Host "$cfg is not valid JSON, so nothing was changed." -ForegroundColor Red
             Write-Host "Open it and fix it (a trailing comma or a comment is the usual cause)."
-            Write-Host "Your file is untouched; a copy is in the backup listed above."
+            Write-Host "Your file is exactly as you left it - this script did not touch it."
             exit 1
         }
     }
@@ -124,8 +116,13 @@ function ToHash($o) {
 $hooks = ToHash $json.hooks
 $changed = $false
 
-# matches this tool's own entries, including the older "semaforo.exe" name
+# Matches this tool's own entries so they can be replaced instead of piled up.
+# The two names cover the current executable and the older "semaforo.exe", but
+# a renamed copy would not match either - and then every run appended a second
+# copy of every hook, forever. So the exact path being installed counts as ours
+# too, whatever the file is called.
 $mine = 'claude-traffic-light\.exe|semaforo\.exe'
+if ($exePath) { $mine += '|' + [regex]::Escape($exePath) }
 
 $map = [ordered]@{
     'SessionStart'     = 'done'
@@ -137,6 +134,8 @@ $map = [ordered]@{
 }
 $withMatcher = @('PreToolUse', 'PostToolUse')
 
+$looksLikeOurs = 0   # entries that smell like this tool but did not match $mine
+
 foreach ($ev in $map.Keys) {
 
     # 1) keep whatever is already there, dropping our own previous entries
@@ -146,7 +145,11 @@ foreach ($ev in $map.Keys) {
         $cmds = @()
         foreach ($hk in @($grp.hooks)) {
             if ($null -eq $hk) { continue }
-            if ("$($hk.command)" -notmatch $mine) { $cmds += $hk }
+            $c = "$($hk.command)"
+            if ($c -notmatch $mine) {
+                if ($c -match '(--state|\s-s)\s+(done|running|waiting)\b') { $looksLikeOurs++ }
+                $cmds += $hk
+            }
         }
         if ($cmds.Count -gt 0) {
             $grp.hooks = @($cmds)
@@ -166,9 +169,13 @@ foreach ($ev in $map.Keys) {
     }
 
     # 2) add ours
+    # [ordered] everywhere: a plain @{} Hashtable has no defined key order, so
+    # "matcher" landed before or after "hooks" at random and every run produced
+    # a different settings.json even when nothing had actually changed.
     $cmd   = '"' + $exePath + '" --state ' + $map[$ev]
-    $entry = @{ hooks = @( @{ type = 'command'; command = $cmd } ) }
+    $entry = [ordered]@{}
     if ($withMatcher -contains $ev) { $entry['matcher'] = '*' }
+    $entry['hooks'] = @( [ordered]@{ type = 'command'; command = $cmd } )
 
     $hooks[$ev] = @($keep + $entry)
     $changed = $true
@@ -180,10 +187,17 @@ if (-not $changed) {
     # abre su settings.json y lo encuentra transformado sin haber cambiado nada.
     Write-Host ""
     Write-Host "Nothing to change: $cfg already matches. File untouched." -ForegroundColor Yellow
+    if ($Remove -and $looksLikeOurs -gt 0) {
+        Write-Host ""
+        Write-Host "Heads up: $looksLikeOurs hook(s) in there look like this tool but point at an" -ForegroundColor Yellow
+        Write-Host "executable with a different name, so they were left alone on purpose." -ForegroundColor Yellow
+        Write-Host "To remove those too, run this again with the path you installed with:" -ForegroundColor Yellow
+        Write-Host '  install-hooks.ps1 -Remove -Exe "C:\path\to\your.exe"' -ForegroundColor Yellow
+    }
     exit 0
 }
 
-# --- write it back ---------------------------------------------------
+# --- build the new contents ------------------------------------------
 if ($hooks.Count -gt 0) {
     $json | Add-Member -NotePropertyName 'hooks' -NotePropertyValue $hooks -Force
 } elseif ($json.PSObject.Properties.Name -contains 'hooks') {
@@ -195,6 +209,34 @@ if ($hooks.Count -gt 0) {
 # parser reject the file - which would leave Claude Code unable to read its
 # own settings, with nothing visibly wrong.
 $text = $json | ConvertTo-Json -Depth 20
+
+# The $changed flag above only means "the hook list was rebuilt", which on an
+# install is always true, so it can never stop a needless write on its own.
+# Compare the finished text against what is on disk instead.
+if ($null -ne $original -and $original -eq $text) {
+    Write-Host ""
+    Write-Host "Nothing to change: $cfg already matches. File untouched." -ForegroundColor Yellow
+    exit 0
+}
+
+# --- write it back ---------------------------------------------------
+if ($null -ne $original) {
+    # Keep the FIRST backup forever: re-running this used to overwrite it with
+    # the already-modified file, so the pristine original was lost. Backups are
+    # only taken when the file is really about to change, so repeated runs no
+    # longer leave a pile of .bak files in the user's .claude folder.
+    $backup = "$cfg.backup-traffic-light"
+    if (-not (Test-Path -LiteralPath $backup)) {
+        Copy-Item -LiteralPath $cfg -Destination $backup
+        Write-Host "Original backed up to $backup" -ForegroundColor DarkGray
+    } else {
+        $stamped = "$cfg." + (Get-Date -Format 'yyyyMMdd-HHmmss') + ".bak"
+        Copy-Item -LiteralPath $cfg -Destination $stamped
+        Write-Host "Backup of the current file: $stamped" -ForegroundColor DarkGray
+        Write-Host "(the untouched original is still at $backup)" -ForegroundColor DarkGray
+    }
+}
+
 [System.IO.File]::WriteAllText($cfg, $text, (New-Object System.Text.UTF8Encoding($false)))
 
 Write-Host ""
