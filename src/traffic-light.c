@@ -615,10 +615,10 @@ static void trayUpdate(BOOL add)
                      : g_state == ST_RUNNING ? L"Yellow - working"
                                              : L"Green - ready";
     if (g_portOk)
-        _snwprintf(nid.szTip, 127, L"Claude Traffic Light v1.4.2\n%s", txt);
+        _snwprintf(nid.szTip, 127, L"Claude Traffic Light v1.4.3\n%s", txt);
     else
         _snwprintf(nid.szTip, 127,
-                   L"Claude Traffic Light v1.4.2\n%s\nPort %d busy: browser cannot connect",
+                   L"Claude Traffic Light v1.4.3\n%s\nPort %d busy: browser cannot connect",
                    txt, g_port);
     nid.szTip[127] = 0;
 
@@ -972,6 +972,32 @@ static int recvRequest(SOCKET c, char *buf, int cap, BOOL *complete)
     return total;
 }
 
+/* Cierre ordenado.
+   Antes se hacia shutdown(SD_BOTH) y closesocket() de una. Si todavia quedaban
+   bytes del pedido sin leer -- justo lo que pasa con una URL mas larga que el
+   buffer -- Windows manda un RST, y el RST descarta lo que el cliente todavia
+   no habia leido: la respuesta que acabamos de enviar se pierde en el camino.
+   En la practica el cliente veia "connection reset" en lugar del 400.
+   Wine no lo reproduce porque debajo hay un stack TCP de Linux; aparecio
+   corriendo verify.ps1 en un Windows de verdad.
+
+   Lo correcto es cerrar solo nuestra mitad de escritura, vaciar lo que quede
+   entrando y recien ahi cerrar. El descarte esta acotado por tamano y por el
+   timeout del socket, asi que un cliente que no deja de mandar no puede
+   entretener al hilo. */
+static void closePolitely(SOCKET c)
+{
+    char sink[1024];
+    int drained = 0;
+    shutdown(c, SD_SEND);
+    while (drained < 64 * 1024) {
+        int n = recv(c, sink, (int)sizeof(sink), 0);
+        if (n <= 0) break;
+        drained += n;
+    }
+    closesocket(c);
+}
+
 /* Busca una cabecera por nombre, al principio de linea y sin distinguir
    mayusculas. La version anterior hacia strstr de "\nOrigin:" con la tabla
    mal escrita (repetida en un caso, sin la variante en minusculas en otro) y
@@ -1046,8 +1072,7 @@ static void handleConn(SOCKET c)
             "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n"
             "Connection: close\r\n\r\n";
         send(c, bad, (int)strlen(bad), 0);
-        shutdown(c, SD_BOTH);
-        closesocket(c);
+        closePolitely(c);
         return;
     }
 
@@ -1103,8 +1128,7 @@ static void handleConn(SOCKET c)
             "Connection: close\r\n\r\nok";
         send(c, resp, (int)strlen(resp), 0);
     }
-    shutdown(c, SD_BOTH);
-    closesocket(c);
+    closePolitely(c);
 }
 
 static volatile LONG g_conns = 0;
