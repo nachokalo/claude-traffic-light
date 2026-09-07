@@ -8,7 +8,7 @@
  *   YELLOW -> Claude is working
  *   GREEN  -> done, ready for a new task
  *
- * Plain Win32: no runtime, no dependencies, ~50 KB, idle when idle.
+ * Plain Win32: no runtime, no dependencies, ~54 KB, idle when idle.
  *
  * MIT licensed. See LICENSE.
  */
