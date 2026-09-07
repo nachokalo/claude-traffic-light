@@ -1,4 +1,6 @@
 # build output
+# build.sh leaves the exe here; the shipped one lives in dist/
+/claude-traffic-light.exe
 *.o
 *.obj
 *.pdb
