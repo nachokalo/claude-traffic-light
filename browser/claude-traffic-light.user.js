@@ -1,7 +1,8 @@
 // ==UserScript==
 // @name         Claude Traffic Light (claude.ai)
 // @namespace    claude-traffic-light
-// @version      3.1
+// @version      3.5
+// @noframes
 // @description  Reports claude.ai's state to the Claude Traffic Light desktop app
 // @match        https://claude.ai/*
 // @match        https://*.claude.ai/*
@@ -23,7 +24,12 @@
   // reason the window has to be generous: a throttled tab can go a while
   // without sending anything. The explicit "done" below is the fast path;
   // this is only the safety net.
-  const WATCH_MS = 20000;
+  // 20 s no alcanzaban: una pestana oculta hace mas de cinco minutos pasa a
+  // "intensive throttling" y sus timers corren una vez por MINUTO, asi que un
+  // silencio largo de Claude dejaba vencer la vigilancia y la luz se iba a
+  // verde en plena respuesta. El "done" explicito sigue siendo el camino
+  // rapido; esto es solo la red por si la pestana se muere.
+  const WATCH_MS = 90000;
   const HEARTBEAT_MS = 1200;
 
   // Re-send the current state this often even when nothing changed, so the
@@ -57,6 +63,7 @@
   // Every tab reports independently, so an idle one used to send "done"
   // while another was still working and knock the light green.
   let otherTabBusyUntil = 0;
+  let wakeTimer = null;
   let composerRoot = null;
   const startedAt = Date.now();
   let channel = null;
@@ -65,10 +72,14 @@
     channel.onmessage = function (e) {
       if (!e || !e.data || !e.data.busy) return;
       otherTabBusyUntil = Date.now() + 5000;
-      // Cuando vence, volver a mirar enseguida en vez de esperar al resync:
-      // si la otra pestana se cerro a mitad de respuesta, si no tardabamos
-      // hasta 15 s en poder decir que termino.
-      setTimeout(function () { check(true); }, 5100);
+      // Un solo despertador pendiente, no uno por mensaje recibido.
+      if (!wakeTimer) {
+        wakeTimer = setTimeout(function () {
+          wakeTimer = null;
+          lastSentAt = 0;      /* que el resync no bloquee el aviso */
+          check(true);
+        }, 5100);
+      }
     };
   } catch (e) { /* no BroadcastChannel: each tab is on its own */ }
 
@@ -100,12 +111,17 @@
     // El rojo tambien ocupa la luz: antes solo se difundia el amarillo, asi
     // que una pestana ociosa pisaba con verde el rojo de otra.
     const holds = (state === 'running' || state === 'waiting');
-    if (holds && channel) {
-      try { channel.postMessage({ busy: true }); } catch (e) {}
-    }
 
     const due = now - lastSentAt >= (holds ? HEARTBEAT_MS - 150 : RESYNC_MS);
     if (state === last && !due) return;
+
+    // El aviso a las otras pestanas va DESPUES del filtro: antes se emitia en
+    // cada chequeo, o sea cinco veces por segundo, y cada mensaje agendaba en
+    // la pestana vecina otro chequeo forzado. Dos pestanas abiertas quemaban
+    // CPU sin mandar un solo byte.
+    if (holds && channel) {
+      try { channel.postMessage({ busy: true }); } catch (e) {}
+    }
 
     last = state;
     lastSentAt = now;
@@ -130,25 +146,17 @@
 
   const inDialog = (el) => !!el.closest('[role="dialog"], [role="alertdialog"]');
 
-  // ---- RED: something is waiting for your confirmation ---------------
-  // Only inside a dialog. Scanning every button on the page meant a settings
-  // toggle reading "Allow analytics" pinned the light red forever.
-  function waitingForYou() {
-    // Mirando el texto entero del dialogo, un cartel de cookies o un mensaje
-    // que dijera "allow me to explain" alcanzaba para dejar la luz en rojo.
-    // El permiso se pide con un boton, asi que miramos los botones.
-    for (const d of document.querySelectorAll('[role="dialog"], [role="alertdialog"]')) {
-      if (!visible(d)) continue;
-      for (const b of d.querySelectorAll('button')) {
-        const l = ((b.getAttribute('aria-label') || b.textContent) || '')
-                    .toLowerCase().trim();
-        if (!l || l.length > 40) continue;
-        if (/^(allow|approve|grant|permitir|aprobar|autorizar)\b/.test(l))
-          return true;
-      }
-    }
-    return false;
-  }
+  // ---- RED ------------------------------------------------------------
+  // There is no red from the browser, on purpose. It used to be read from
+  // dialogs, and every version found a new way to be wrong: a settings toggle
+  // reading "Allow analytics", a message merely saying "allow me to explain",
+  // then a cookie banner with an "Allow all cookies" button. Each false
+  // positive stuck the light red until the dialog was dismissed, and since red
+  // is broadcast, one bad tab held every other tab hostage.
+  //
+  // claude.ai does not really ask for permission the way Claude Code does, so
+  // the feature was buying an unreliable signal for a case that barely exists.
+  // Red still works, and works exactly, through the Claude Code hooks.
 
   // ---- YELLOW, signal 1: the stop button, or a running tool ----------
   // These stay present through the silent gaps while Claude thinks between
@@ -159,21 +167,39 @@
   // any message mentioning the word as a permanent stop button. And buttons
   // inside a dialog are skipped — "Cancel" in a modal is not Claude working,
   // which is also why "cancel" is not in this list at all.
-  const STOP_WORDS = /^(detener|stop|parar|deten[eé])\b/;
+  // Sin la /u, \b despues de una vocal acentuada no matchea, asi que
+  // "detene" nunca se reconocia. Miramos el separador a mano.
+  const STOP_WORDS = /^(detener|stop|parar|deten[eé]|det[eé]n)(\s|$|[-:.])/;
   const STOP_LABEL_MAX = 40;
 
   function positiveSignal() {
-    // Buscamos primero dentro del compositor, que es donde el boton de enviar
-    // se convierte en el de detener. Sin eso, un "Stop sharing screen" de otra
-    // extension dejaba la luz amarilla para siempre.
-    const scope = (composerRoot && document.contains(composerRoot))
-                    ? composerRoot : document;
-    for (const b of scope.querySelectorAll('button')) {
+    // El boton de detener se busca DENTRO del compositor, que es donde el de
+    // enviar se convierte en el de detener. Barrer la pagina entera hacia que
+    // un "Stop sharing" de otra extension dejara la luz amarilla para siempre.
+    //
+    // Pero si todavia no ubicamos el compositor tampoco podemos ignorarlo: si
+    // recargas la pagina en medio de una respuesta, el boton de enviar no
+    // aparece hasta que termina, y nos quedariamos en verde toda la respuesta.
+    // En ese caso lo buscamos igual, pero exigimos ademas que la pagina se
+    // haya movido hace poco: una respuesta de verdad se esta escribiendo, un
+    // boton ajeno de otra barra no viene acompanado de nada.
+    const known = composerRoot && document.contains(composerRoot);
+    const scope = known ? composerRoot : document;
+    const trusted = known || (Date.now() - lastBusyAt) < 3000;
+    for (const b of (trusted ? scope.querySelectorAll('button') : [])) {
       const l = label(b);
       if (!l || l.length > STOP_LABEL_MAX) continue;
       if (!STOP_WORDS.test(l.toLowerCase())) continue;
       if (inDialog(b)) continue;
-      if (visible(b)) { signal = 'stop-button'; return true; }
+      if (visible(b)) {
+        // Si llegamos hasta aca sin conocer el compositor -- tipico de una
+        // recarga en medio de una respuesta -- lo aprendemos del propio boton
+        // de detener, que vive ahi. Si no, al primer silencio largo se nos
+        // acababa la confianza y solabamos el turno.
+        if (!known) rememberComposer(b);
+        signal = 'stop-button';
+        return true;
+      }
     }
 
     for (const pill of document.querySelectorAll('[data-testid="tool-status-pill"]')) {
@@ -188,16 +214,24 @@
     return false;
   }
 
-  function sendButtonVisible() {
-    const b = document.querySelector('[data-testid="chat-input-send"]');
-    if (!b || !visible(b)) return false;
-    // Nos guardamos donde vive el compositor mientras podemos verlo.
-    let root = b.closest('form');
+  function rememberComposer(el) {
+    let root = el.closest('form');
     if (!root) {
-      root = b;
+      root = el;
       for (let i = 0; i < 4 && root.parentElement; i++) root = root.parentElement;
     }
     composerRoot = root;
+  }
+
+  function sendButtonVisible() {
+    // querySelector devolvia el primero del documento aunque estuviera oculto
+    // (una vista anterior de la SPA), y entonces nunca miraba el de verdad.
+    let b = null;
+    for (const cand of document.querySelectorAll('[data-testid="chat-input-send"]')) {
+      if (visible(cand)) { b = cand; break; }
+    }
+    if (!b) return false;
+    rememberComposer(b);   /* mientras podemos verlo, nos guardamos donde vive */
     return true;
   }
 
@@ -256,7 +290,18 @@
     // y cualquier cosa que refresque texto cada tanto (un reloj relativo en el
     // panel lateral, un aviso) alcanzaba para dejarlo amarillo indefinidamente.
     if (sendButtonVisible()) return false;
-    return streak >= STREAK_NEEDED && (now - lastBusyAt) < QUIET_MS;
+
+    // Si nunca pudimos ubicar el compositor, el respaldo por actividad queda
+    // habilitado permanentemente y cualquier texto que se refresque solo deja
+    // la luz amarilla para siempre. Preferimos quedarnos cortos: sin
+    // compositor reconocido, exigimos el doble de racha.
+    const need = composerRoot ? STREAK_NEEDED : STREAK_NEEDED * 2;
+    const activo = streak >= need && (now - lastBusyAt) < QUIET_MS;
+
+    // Un turno detectado solo por actividad tambien abre el latch, si no
+    // parpadeaba a verde en cada pausa de mas de 1,6 s.
+    if (activo) { inTurn = true; lastPositiveAt = now; }
+    return activo;
   }
 
   // Diagnostics are published as an attribute on <html>. Userscripts run in an
@@ -268,7 +313,7 @@
   function publishDebug(positive) {
     try {
       document.documentElement.setAttribute('data-semaforo', JSON.stringify({
-        v: '3.1',
+        v: '3.5',
         reportando: last,
         msDesdeActividad: lastBusyAt ? Date.now() - lastBusyAt : null,
         racha: streak,
@@ -291,9 +336,8 @@
 
     const positive = positiveSignal();
 
-    if (waitingForYou())        report('waiting');
-    else if (busy(positive))    report('running');
-    else                        report('done');
+    if (busy(positive))  report('running');
+    else                 report('done');
 
     publishDebug(positive);
   }
@@ -319,7 +363,11 @@
 
     if (streaming) {
       const now = Date.now();
-      if (now - lastBusyAt > 1500) streak = 0;   /* se corto: volvemos a cero */
+      // Medio segundo, no uno y medio: con 1500 ms, algo que se refresca cada
+      // 1,4 s -- un reloj relativo en la barra lateral -- mantenia la racha
+      // viva indefinidamente y la luz se quedaba amarilla. Una respuesta real
+      // produce lotes muchas veces por segundo.
+      if (now - lastBusyAt > 500) streak = 0;
       streak++;
       lastBusyAt = now;
       lastPath = describe(streamingTarget);
