@@ -297,7 +297,7 @@ With several claude.ai tabs open they coordinate over a `BroadcastChannel`, so
 an idle tab cannot announce "done" over another tab's answer.
 
 **The completion timeout lives in the desktop app, not in the browser.** While
-Claude works the userscript sends `running` as a heartbeat with `&w=20000`; if
+Claude works the userscript sends `running` as a heartbeat with `&w=90000`; if
 that heartbeat stops for that long, the app turns green on its own. Browsers
 throttle timers in background tabs — sometimes to once a minute — which is
 exactly when the light matters, so the countdown cannot live there.
