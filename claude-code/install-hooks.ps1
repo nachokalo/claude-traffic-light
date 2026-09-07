@@ -23,11 +23,14 @@ $ErrorActionPreference = 'Stop'
 
 # --- locate the executable ------------------------------------------
 if ($Exe) {
-    if (-not (Test-Path $Exe)) {
-        Write-Host "No file at -Exe path: $Exe" -ForegroundColor Red
+    # -LiteralPath en todo: sin eso, una carpeta como "claude-traffic-light[1]"
+    # -- el nombre que pone Windows a una descarga repetida -- se interpreta
+    # como comodin y el archivo "no existe".
+    if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
+        Write-Host "No file at -Exe path (or it is a folder, not the exe): $Exe" -ForegroundColor Red
         exit 1
     }
-    $exePath = (Resolve-Path $Exe).Path
+    $exePath = (Resolve-Path -LiteralPath $Exe).Path
 } else {
     $root = Split-Path -Parent $PSScriptRoot
     $exePath = $null
@@ -35,7 +38,10 @@ if ($Exe) {
         (Join-Path $root 'claude-traffic-light.exe'),
         (Join-Path $root 'dist\claude-traffic-light.exe'),
         (Join-Path $PSScriptRoot 'claude-traffic-light.exe'))) {
-        if (Test-Path $candidate) { $exePath = (Resolve-Path $candidate).Path; break }
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $exePath = (Resolve-Path -LiteralPath $candidate).Path
+            break
+        }
     }
 }
 
@@ -55,18 +61,18 @@ if ($exePath -and -not $Remove) {
 $dir = Join-Path $env:USERPROFILE '.claude'
 $cfg = Join-Path $dir 'settings.json'
 
-if ($Remove -and -not (Test-Path $cfg)) {
+if ($Remove -and -not (Test-Path -LiteralPath $cfg)) {
     Write-Host "Nothing to do: $cfg does not exist." -ForegroundColor Yellow
     exit 0
 }
-if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
 
 # --- read settings.json ---------------------------------------------
-if (Test-Path $cfg) {
+if (Test-Path -LiteralPath $cfg) {
     # Keep the FIRST backup forever: re-running this used to overwrite it with
     # the already-modified file, so the pristine original was lost.
     $backup = "$cfg.backup-traffic-light"
-    if (-not (Test-Path $backup)) {
+    if (-not (Test-Path -LiteralPath $backup)) {
         Copy-Item $cfg $backup
         Write-Host "Original backed up to $backup" -ForegroundColor DarkGray
     } else {
@@ -108,12 +114,15 @@ if ($null -ne $json.hooks -and
 }
 
 function ToHash($o) {
-    $h = @{}
+    # [ordered] para que el archivo escrito no cambie de orden en cada corrida:
+    # con una Hashtable comun, cada ejecucion producia un diff distinto.
+    $h = [ordered]@{}
     if ($null -ne $o) { foreach ($p in $o.PSObject.Properties) { $h[$p.Name] = $p.Value } }
     return $h
 }
 
 $hooks = ToHash $json.hooks
+$changed = $false
 
 # matches this tool's own entries, including the older "semaforo.exe" name
 $mine = 'claude-traffic-light\.exe|semaforo\.exe'
@@ -146,7 +155,13 @@ foreach ($ev in $map.Keys) {
     }
 
     if ($Remove) {
-        if ($keep.Count -gt 0) { $hooks[$ev] = @($keep) } else { $hooks.Remove($ev) }
+        if ($keep.Count -gt 0) {
+            if (@($hooks[$ev]).Count -ne $keep.Count) { $changed = $true }
+            $hooks[$ev] = @($keep)
+        } elseif ($hooks.Contains($ev)) {
+            $hooks.Remove($ev)
+            $changed = $true
+        }
         continue
     }
 
@@ -156,6 +171,16 @@ foreach ($ev in $map.Keys) {
     if ($withMatcher -contains $ev) { $entry['matcher'] = '*' }
 
     $hooks[$ev] = @($keep + $entry)
+    $changed = $true
+}
+
+if (-not $changed) {
+    # Reescribir el archivo sin necesidad no es inocuo: ConvertTo-Json de
+    # PowerShell 5.1 escapa < > & ' como \u003c y compania, asi que el usuario
+    # abre su settings.json y lo encuentra transformado sin haber cambiado nada.
+    Write-Host ""
+    Write-Host "Nothing to change: $cfg already matches. File untouched." -ForegroundColor Yellow
+    exit 0
 }
 
 # --- write it back ---------------------------------------------------
