@@ -615,10 +615,10 @@ static void trayUpdate(BOOL add)
                      : g_state == ST_RUNNING ? L"Yellow - working"
                                              : L"Green - ready";
     if (g_portOk)
-        _snwprintf(nid.szTip, 127, L"Claude Traffic Light v1.4.3\n%s", txt);
+        _snwprintf(nid.szTip, 127, L"Claude Traffic Light v1.4.4\n%s", txt);
     else
         _snwprintf(nid.szTip, 127,
-                   L"Claude Traffic Light v1.4.3\n%s\nPort %d busy: browser cannot connect",
+                   L"Claude Traffic Light v1.4.4\n%s\nPort %d busy: browser cannot connect",
                    txt, g_port);
     nid.szTip[127] = 0;
 
@@ -782,12 +782,20 @@ static void showLight(void)
     /* La activacion de la otra ventana puede completarse despues de esto,
        asi que lo repetimos un rato mas tarde para ganarle a los rezagados. */
     SetTimer(g_hwnd, TIMER_RAISE, 250, NULL);
+    BOOL reverting = (g_phase == PH_OUT);
     if (g_phase == PH_HIDDEN || g_phase == PH_OUT)
         g_phase = PH_IN;                 /* arrancar (o revertir) el fundido */
     else if (g_phase != PH_IN)
         g_phase = PH_HOLD;               /* ya visible: reiniciar la espera  */
 
     g_holdStart = GetTickCount();
+    /* Revertir un fundido de salida tiene que continuar desde la opacidad
+       actual. Reiniciando el reloj a secas, el siguiente cuadro calculaba el
+       alfa desde cero y la luz pegaba un parpadeo a casi transparente antes de
+       volver: se ve cada vez que llega un estado nuevo mientras se esta
+       apagando, que con los hooks de Claude Code pasa seguido. */
+    if (reverting && g_maxAlpha > 0 && g_alpha > 0)
+        g_holdStart -= (DWORD)((double)g_fadeInMs * g_alpha / g_maxAlpha);
     SetTimer(g_hwnd, TIMER_ANIM, 16, NULL);
     paintNow();
 }
@@ -1105,7 +1113,14 @@ static void handleConn(SOCKET c)
                    los suyos cuando la pestana esta en segundo plano. */
                 int watch = wv ? atoi(wv) : 0;
                 if (watch < 0) watch = 0;
-                if (watch > 60000) watch = 60000;
+                /* El tope existe para que un cliente roto no deje la vigilancia
+                   armada durante horas. Estaba en 60 s, por debajo de los 90 s
+                   que pide el userscript: el recorte era silencioso y dejaba
+                   viva justo la falla que los 90 s arreglaban -- una pestana de
+                   fondo con los temporizadores estrangulados a uno por minuto
+                   llegaba tarde y la luz se iba a verde en plena respuesta.
+                   Cinco minutos deja lugar de sobra y sigue siendo un tope. */
+                if (watch > 300000) watch = 300000;
 
                 if (st >= 0)
                     PostMessage(g_hwnd, WM_SETSTATE, (WPARAM)st, (LPARAM)watch);
@@ -1329,8 +1344,9 @@ static BOOL sendToRunning(const WCHAR *word)
     for (; word[i] && i < 63; ++i) ascii[i] = (char)(word[i] & 0x7F);
     ascii[i] = 0;
 
-    /* Un estado que no existe se rechaza aca, para que el codigo de salida
-       distinga "no llego" de "no lo entendi". */
+    /* Un estado que no existe se rechaza aca en vez de mandarse. Ojo: el
+       codigo de salida NO distingue este caso de "no habia instancia" -- los
+       dos terminan en 1. */
     if (_stricmp(ascii, "show") && parseStateToken(ascii) < 0) return FALSE;
 
     COPYDATASTRUCT cds;
