@@ -13,11 +13,15 @@ It is deliberately simpler, and you should know what it gives up:
 
 - It reads Claude's state **only** from the stop button and the tool status
   pill. The userscript also falls back to watching the page for activity, so
-  if claude.ai renames that button the userscript keeps working and the
-  bookmarklet goes quiet.
+  if claude.ai renames that button the userscript keeps working while the
+  bookmarklet reports **green for the whole answer** — it does not fall
+  silent, which would at least be obvious; it confidently says "done".
 - It searches the whole page for the stop button instead of just the composer,
   so another tab-mate — a screen-sharing bar with a "Stop sharing" button, say
-  — can hold the light yellow.
+  — can hold the light yellow. The userscript scopes the search to the
+  composer once it has found it; until then, or after claude.ai navigates and
+  the old composer is gone, it widens to the page too — so this is a
+  difference of degree, not something the userscript is immune to.
 - It does not coordinate between tabs, so with two claude.ai tabs open the
   light can flicker.
 - It does not publish the `data-semaforo` diagnostics the README describes.
@@ -60,7 +64,9 @@ javascript:(function(){var P=8787,W=90000,u=null,t=null,hb=0;if(window.__ctl){al
 - Test the app on its own first — open this in the browser:
   <http://127.0.0.1:8787/state?s=running>
   The light should turn yellow and the page should print `ok`. That proves the
-  app is listening; it does not prove the bookmarklet can reach it.
+  app is listening; it does not prove the bookmarklet can reach it. This URL
+  carries no watchdog, so the light stays yellow until you tell it otherwise:
+  follow it with <http://127.0.0.1:8787/state?s=done> to put it back.
 - To prove the bookmarklet itself works: click it, then ask Claude something
   that takes a few seconds and watch the light go yellow. If the app responds
   to the URL above but never reacts to the bookmarklet, the page's content
