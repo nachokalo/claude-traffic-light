@@ -3,7 +3,7 @@
 A tiny traffic light that tells you what Claude is doing, so you can go do
 something else while it works.
 
-It slides in at the edge of your screen the moment you switch away from Claude,
+It fades in at the edge of your screen the moment you switch away from Claude,
 shows the current state, and fades out on its own. It comes back whenever the
 state changes.
 
@@ -53,9 +53,10 @@ is the same thing without the hardware.
   `Sec-Fetch-Dest` says it came from an embedded tag such as `<img>` rather
   than a `fetch`, or if its headers did not arrive complete. Those signals come
   from the browser, so treat this as a filter and not a guarantee — a request
-  with no headers at all is accepted, because that is what the Claude Code
-  hooks and the userscript look like. The worst a page could do with it is
-  change the colour of a decorative light.
+  with no headers at all is accepted, because that is what a script or `curl`
+  driving the light deliberately looks like. (The Claude Code hooks never go
+  near the HTTP listener; they talk to the running app directly.) The worst a
+  page could do with it is change the colour of a decorative light.
 
 ---
 
@@ -171,6 +172,28 @@ title_match       = claude  ; lowercase substring that identifies "the Claude wi
 port              = 8787    ; local port, 127.0.0.1 only
 ```
 
+Every numeric setting is clamped, silently, to a range that keeps the thing
+usable — so an extreme value gives you the nearest sane one rather than a
+light you cannot see or dismiss:
+
+| Setting | Accepted range |
+| --- | --- |
+| `margin` | 0 – 400 |
+| `size_pct` | 40 – 250 |
+| `vertical_pct` | 0 – 100 |
+| `duration_ms` | 300 – 60000 |
+| `fade_in_ms`, `fade_out_ms` | 1 – 5000 |
+| `opacity` | 30 – 255 |
+| `port` | 1 – 65535 (anything else falls back to 8787) |
+
+A value that isn't a number is ignored and the setting keeps its default —
+`size_pct = abc` leaves it at 75 rather than collapsing to zero. There is no
+log, so if a setting seems to do nothing, check it is a bare integer.
+
+`position` is matched as a substring, not validated against the list: a typo
+like `rigth` contains neither `left`, `top` nor `bottom`, so it quietly lands
+in the default right-hand position.
+
 `title_match` is how it recognises the Claude window: it lowercases the active
 window's title and looks for this substring. That covers both a terminal
 running Claude Code and a `claude.ai` browser tab. If your terminal doesn't put
@@ -212,14 +235,21 @@ Accepted values: `waiting` / `red`, `running` / `yellow` / `busy`,
 `done` / `green` / `idle`. Launching a second instance doesn't start a second
 copy — it just shows the running one.
 
-`--state` exits with 0 if it reached a running instance and 1 if there was
-none, so a script can tell whether the light actually got the message. `-s`
-is a short alias for it.
+`--state` exits 0 when the message reached a running instance. It exits 1
+otherwise, which covers both "nothing was running" and "that is not a state I
+know" — the exit code does not tell those two apart, so check your spelling
+before concluding the app is down. An unknown flag, and `--state` with no
+value at all, also exit 1. `-s` is a short alias for `--state`.
 
 `w` on its own, with no `s`, refreshes the watchdog without changing the
-colour. Nothing in this repo sends that form — the browser heartbeat always
-sends the state too — but it is there if you drive the light from your own
-script.
+colour — but only while the light is already yellow, since that is the only
+state the watchdog runs in. Sent while the light is red or green it does
+nothing. The browser heartbeat always sends the state too, so nothing here
+relies on it; it is there if you drive the light from your own script.
+
+`w` is capped at 300000 (five minutes), and it is only honoured together with
+`running` — a red or green sent with `w` clears the watchdog instead of arming
+one.
 
 ---
 
@@ -255,18 +285,21 @@ powershell -ExecutionPolicy Bypass -File verify.ps1
 ```
 
 It starts the app if it isn't running, exercises the local server (including
-the requests that are supposed to be *ignored*), checks every exit code, and
-puts the hook installer through fifteen scenarios — a fresh profile, a profile
+the requests that are supposed to be *ignored*), checks the exit codes, and
+runs seventeen checks against the hook installer — a fresh profile, a profile
 that already has hooks from another tool, invalid JSON, repeated runs — all
 inside a throwaway folder under `%TEMP%`, so your real `settings.json` is never
 touched.
 
-The last few checks are the ones no script can answer on its own: whether the
-light actually appears when you leave the Claude window, whether the tray icon
-is there, and whether it lands correctly on a second monitor or at a non-100%
-display scale. It asks you those as yes/no questions. `-Quick` skips them.
+The last checks are the ones no script can answer on its own: whether each
+colour really appears, whether the tray icon is there, whether the light stays
+hidden while you are in Claude and shows up on top when you leave, whether a
+page pretending to be another site can change it, and whether a second monitor
+or a non-100% display scale still places it correctly. It asks you those as
+yes/no questions. `-Quick` skips them.
 
-It exits 0 when everything passed and 1 otherwise, so it can gate a release.
+It exits 0 when everything passed, 1 when something failed, and 2 if it could
+not find the executable at all — so it can gate a release.
 
 ## How it decides what to show
 

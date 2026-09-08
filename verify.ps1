@@ -155,8 +155,12 @@ if ($null -ne $r -and $r.Length -gt 0) {
     $r5 = Raw "OPTIONS /state?s=running HTTP/1.1`r`nHost: 127.0.0.1`r`n`r`n"
     Check "an OPTIONS preflight is answered" ($null -ne $r5 -and $r5.Length -gt 0) ""
 
+    # The server answers ok to everything by design, so this can only assert
+    # that a bare w is accepted and does not upset it - NOT that the watchdog
+    # was refreshed, which has no read-back. Naming it honestly: an earlier
+    # version called this "w refreshes the watchdog" and could never fail.
     $r6 = Req '/state?w=5000' @()
-    Check "w on its own refreshes the watchdog" ($r6 -match 'ok') ""
+    Check "a bare w is accepted" ($r6 -match 'ok') "cannot verify the refresh itself"
 } else {
     Skipped "the rest of the server checks" "nothing is listening on $Port"
     Write-Host "        If the app is running, something else has taken the port." -ForegroundColor DarkGray
@@ -323,7 +327,7 @@ if ($Quick) {
     Skipped "the visual checks" "-Quick was passed"
 } else {
     Section "What only you can see"
-    Write-Host "  Six quick questions. Answer y or n." -ForegroundColor DarkGray
+    Write-Host "  A few quick questions. Answer y, n, or s to skip." -ForegroundColor DarkGray
     Write-Host ""
 
     function Ask($name, $instruction) {
