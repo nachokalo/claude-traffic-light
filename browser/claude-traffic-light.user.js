@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude Traffic Light (claude.ai)
 // @namespace    claude-traffic-light
-// @version      3.5
+// @version      3.6
 // @noframes
 // @description  Reports claude.ai's state to the Claude Traffic Light desktop app
 // @match        https://claude.ai/*
@@ -295,7 +295,13 @@
     // habilitado permanentemente y cualquier texto que se refresque solo deja
     // la luz amarilla para siempre. Preferimos quedarnos cortos: sin
     // compositor reconocido, exigimos el doble de racha.
-    const need = composerRoot ? STREAK_NEEDED : STREAK_NEEDED * 2;
+    // Mismo criterio que en sendButtonVisible(): un compositor recordado solo
+    // vale si sigue en el documento. Preguntando solo si la variable existe,
+    // despues de navegar dentro de la SPA el nodo viejo queda desconectado
+    // pero la variable sigue apuntando a el, y esta proteccion se apagaba sola
+    // para el resto de la vida de la pestana.
+    const composerLive = composerRoot && document.contains(composerRoot);
+    const need = composerLive ? STREAK_NEEDED : STREAK_NEEDED * 2;
     const activo = streak >= need && (now - lastBusyAt) < QUIET_MS;
 
     // Un turno detectado solo por actividad tambien abre el latch, si no
